@@ -1,0 +1,3322 @@
+From 485979b3410d4b7dcb2bfaba5b7a68c08ab873b1 Mon Sep 17 00:00:00 2001
+From: zhuchen <zhuchen@loongson.cn>
+Date: Tue, 14 Mar 2023 20:05:19 +0800
+Subject: [PATCH] Loongarch64 vector optimization with SHA.
+
+---
+ Configurations/00-base-templates.conf |    2 +-
+ crypto/loongarchcap.c                 |   24 +-
+ crypto/sha/asm/sha1-loongarch64.pl    | 1310 +++++++++++++++++++++
+ crypto/sha/asm/sha512-loongarch.pl    |  342 ------
+ crypto/sha/asm/sha512-loongarch64.pl  | 1560 +++++++++++++++++++++++++
+ crypto/sha/build.info                 |   10 +-
+ 6 files changed, 2895 insertions(+), 353 deletions(-)
+ create mode 100755 crypto/sha/asm/sha1-loongarch64.pl
+ delete mode 100644 crypto/sha/asm/sha512-loongarch.pl
+ create mode 100755 crypto/sha/asm/sha512-loongarch64.pl
+
+diff --git a/Configurations/00-base-templates.conf b/Configurations/00-base-templates.conf
+index 8cf51f8..cca63b7 100644
+--- a/Configurations/00-base-templates.conf
++++ b/Configurations/00-base-templates.conf
+@@ -291,7 +291,7 @@ my %targets=(
+ 	bn_asm_src      => "bn_asm.c loongarch-mont.S",
+ 	aes_asm_src     => "aes_cbc.c aes-loongarch.S vpaes-loongarch64.s",
+ 	poly1305_asm_src=> "poly1305-loongarch.S",
+-	sha1_asm_src    => "sha256-loongarch.S sha512-loongarch.S",
++	sha1_asm_src    => "sha1-loongarch64.S sha256-loongarch64.S sha512-loongarch64.S",
+     },
+     s390x_asm => {
+ 	template	=> 1,
+diff --git a/crypto/loongarchcap.c b/crypto/loongarchcap.c
+index 91d18d5..02f6098 100644
+--- a/crypto/loongarchcap.c
++++ b/crypto/loongarchcap.c
+@@ -1,14 +1,26 @@
+ #include "loongarch_arch.h"
++#include <sys/auxv.h>
++
++#define CPUCFG_LSX_BIT 6
++#define CPUCFG_LASX_BIT 7
++
++#define AT_HWCAP_LSX_BIT 4
++#define AT_HWCAP_LASX_BIT 5
+ 
+ unsigned int OPENSSL_loongarchcap_P = 0;
+ 
+ void OPENSSL_cpuid_setup(void)
+ {
+-	unsigned int reg;
+-	__asm__ volatile(
+-	    "cpucfg %0, %1 \n\t"
+-	    : "+&r"(reg)
+-	    : "r"(LOONGARCH_CFG2)
+-	);
++	unsigned long hwcap;
++	unsigned int reg = 0;
++	hwcap = getauxval(AT_HWCAP);
++	if(hwcap & (1<<AT_HWCAP_LSX_BIT))
++	{
++		reg |= (1<<CPUCFG_LSX_BIT);
++	}
++	if(hwcap & (1<<AT_HWCAP_LASX_BIT))
++	{
++		reg |= (1<<CPUCFG_LASX_BIT);
++	}
+ 	OPENSSL_loongarchcap_P = reg;
+ }
+diff --git a/crypto/sha/asm/sha1-loongarch64.pl b/crypto/sha/asm/sha1-loongarch64.pl
+new file mode 100755
+index 0000000..3214ec6
+--- /dev/null
++++ b/crypto/sha/asm/sha1-loongarch64.pl
+@@ -0,0 +1,1310 @@
++#! /usr/bin/env perl
++# Copyright 2006-2023 The OpenSSL Project Authors. All Rights Reserved.
++#
++# Licensed under the OpenSSL license (the "License").  You may not use
++# this file except in compliance with the License.  You can obtain a copy
++# in the file LICENSE in the source distribution or at
++# https://www.openssl.org/source/license.html
++
++#
++# ====================================================================
++# Written by Andy Polyakov <appro@openssl.org> for the OpenSSL
++# project. The module is, however, dual licensed under OpenSSL and
++# CRYPTOGAMS licenses depending on where you obtain it. For further
++# details see http://www.openssl.org/~appro/cryptogams/.
++# ====================================================================
++
++# Loongarch64 LSX and LASX adaptation by <zhuchen@loongson.cn>,
++# <lujingfeng@loongson.cn> and <shichenlong@loongson.cn>
++#
++
++
++($zero,$ra,$tp,$sp)=map("\$r$_",(0..3));
++($a0,$a1,$a2,$a3,$a4,$a5,$a6,$a7)=map("\$r$_",(4..11));
++($v0,$v1)=map("\$r$_",(4..5));
++($t0,$t1,$t2,$t3,$t4,$t5,$t6,$t7,$t8,$t9)=map("\$r$_",(12..21));
++($s0,$s1,$s2,$s3,$s4,$s5,$s6,$s7)=map("\$r$_",(23..30));
++($vr0,$vr1,$vr2,$vr3,$vr4,$vr5,$vr6,$vr7,$vr8,$vr9,$vr10,$vr11,$vr12,$vr13,$vr14,$vr15,$vr16,$vr17,$vr18,$vr19)=map("\$vr$_",(0..19));
++($xr0,$xr1,$xr2,$xr3,$xr4,$xr5,$xr6,$xr7,$xr8,$xr9,$xr10,$xr11,$xr12,$xr13,$xr14,$xr15,$xr16,$xr17,$xr18,$xr19)=map("\$xr$_",(0..19));
++($fp)=map("\$r$_",(22));
++
++    $PTR_LA = "li.d";
++    $PTR_ADD= "addi.d";
++    $PTR_INS= "bstrins.d";
++    $REG_S  = "st.d";
++    $REG_L  = "ld.d";
++    $PTR_SLL= "sll.d";
++    $SZREG  = 8;
++
++
++for (@ARGV) {   $output=$_ if (/\w[\w\-]*\.\w+$/);      }
++open STDOUT,">$output";
++while (($output=shift) && ($output!~/\w[\w\-]*\.\w+$/)) {}
++open STDOUT,">$output";
++
++$ctx="\$a0";	# 1st arg
++$inp="\$a1";	# 2nd arg
++$num="\$a2";	# 3rd arg
++
++# reassign arguments in order to produce more compact code
++$ctx=$a4;
++$inp=$a5;
++$num=$a6;
++
++$bt0=$t5;
++$bt1=$s4;
++$bt2=$a3;
++@xi=($a2,$fp,$s2);
++$A=$a1;
++$B=$a0;
++$C=$a7;
++$D=$s0;
++$E=$s1;
++
++@V=($A,$B,$C,$D,$E);
++
++$code.=<<___;
++.text
++.extern	OPENSSL_loongarchcap_P
++
++.globl	sha1_block_data_order
++.align	4
++sha1_block_data_order:
++	la.local	$t0,OPENSSL_loongarchcap_P
++	ld.w		$t1,$t0,0
++	addi.w		$t2,$zero,1
++	slli.w		$t3,$t2,7
++	and		$t4,$t3,$t1
++	bne		$t4,$zero,_lasx_shortcut
++	slli.w		$t3,$t2,6
++	and		$t4,$t3,$t1
++	bne		$t4,$zero,_lsx_shortcut
++	b		_la_shortcut
++
++.size	sha1_block_data_order,.-sha1_block_data_order
++___
++{{{
++my $Xi=4;
++my @X=map("\$vr$_",(4..7,0..3));
++my @Tx=map("\$vr$_",(8..10));
++my $Kx=$vr11;
++my @V=($A,$B,$C,$D,$E)=($t5,$s4,$a3,$a2,$fp);	# size optimization
++my @T=($a1,$a0);
++my $j=0;
++my $rx=0;
++my $K_XX_XX=$s2;
++
++
++{ my $sn;
++sub align32() {
++  ++$sn;
++$code.=<<___;
++    b   .Lalign32_$sn	# see "Decoded ICache" in manual
++.align	32
++.Lalign32_$sn:
++___
++}
++}
++
++sub AUTOLOAD()		# thunk [simplified] 32-bit style perlasm
++{ my $opcode = $AUTOLOAD; $opcode =~ s/.*:://;$opcode =~ s/_/\./;
++  my $arg = pop;
++    $arg = "$arg" if ($arg*1 eq $arg);
++    $code .= "\t$opcode\t".join(',',$arg,reverse @_)."\n";
++}
++
++sub body_00_19 () {	# ((c^d)&b)^d
++	# on start @T[0]=(c^d)&b
++	return &body_20_39() if ($rx==19); $rx++;
++	(
++	'($a,$b,$c,$d,$e)=@V;'.
++	'&rotri_w($j?7:2,$b,$b)',	# $b>>>2
++	'&xor($d,@T[0],@T[0])',
++	'&move($a,@T[1])',	# $b for next round
++
++	'&ld_w(eval(4*($j&15)),$sp,$t0)',	# X[]+K xfer
++	'&add_w($t0,$e,$e)',
++	'&xor($c,$b,$b)',	# $c^$d for next round
++
++	'&rotri_w(32-5,$a,$a)',
++	'&add_w(@T[0],$e,$e)',
++	'&and($b,@T[1],@T[1])',	# ($b&($c^$d)) for next round
++
++	'&xor($c,$b,$b)',	# restore $b
++	'&add_w($a,$e,$e);'	.'$j++; unshift(@V,pop(@V)); unshift(@T,pop(@T));'
++	);
++}
++
++sub body_20_39 () {	# b^d^c
++	# on entry @T[0]=b^d
++	return &body_40_59() if ($rx==39); $rx++;
++	(
++	'($a,$b,$c,$d,$e)=@V;'.
++	'&ld_w(eval(4*($j&15)),$sp,$t0)',	# X[]+K xfer
++	'&add_w($t0,$e,$e)',
++	'&xor	($d,@T[0],@T[0])	if($j==19);'.
++	'&xor	($c,@T[0],@T[0])	if($j> 19)',	# ($b^$d^$c)
++	'&move	($a,@T[1])',	# $b for next round
++
++	'&rotri_w(32-5,$a,$a)',
++	'&add_w	(@T[0],$e,$e)',
++	'&xor	($c,@T[1],@T[1])	if ($j< 79)',	# $b^$d for next round
++
++	'&rotri_w(7,$b,$b)',	# $b>>>2
++	'&add_w	($a,$e,$e);'	.'$j++; unshift(@V,pop(@V)); unshift(@T,pop(@T));'
++	);
++}
++
++sub body_40_59 () {	# ((b^c)&(c^d))^c
++	# on entry @T[0]=(b^c), (c^=d)
++	$rx++;
++	(
++	'($a,$b,$c,$d,$e)=@V;'.
++	'&ld_w(eval(4*($j&15)),$sp,$t0)',	# X[]+K xfer
++	'&add_w($t0,$e,$e)',
++	'&and	($c,@T[0],@T[0])	if ($j>=40)',	# (b^c)&(c^d)
++	'&xor	($d,$c,$c)		if ($j>=40)',	# restore $c
++
++	'&rotri_w(7,$b,$b)',	# $b>>>2
++	'&move	($a,@T[1])',	# $b for next round
++	'&xor	($c,@T[0],@T[0])',
++
++	'&rotri_w(32-5,$a,$a)',
++	'&add_w	(@T[0],$e,$e)',
++	'&xor	($c,@T[1],@T[1])	if ($j==59);'.
++	'&xor	($b,@T[1],@T[1])	if ($j< 59)',	# b^c for next round
++
++	'&xor	($c,$b,$b)	if ($j< 59)',	# c^d for next round
++	'&add_w	($a,$e,$e);'	.'$j++; unshift(@V,pop(@V)); unshift(@T,pop(@T));'
++	);
++}
++
++
++{
++$Xi=4;				# reset variables
++@X=map("\$vr$_",(4..7,0..3));
++@Tx=map("\$vr$_",(8..10));
++$j=0;
++$rx=0;
++
++my $done_lsx_label=".Ldone_lsx";
++
++$code.=<<___;
++#.type	sha1_block_data_order_lsx,\@function,3
++.align	4
++sha1_block_data_order_lsx:
++_lsx_shortcut:
++	addi.d	$sp,$sp,-64
++	addi.d	$t7,$sp,0
++	st.d	$s4,$sp,56
++	st.d	$fp,$sp,48
++	st.d	$s0,$sp,40
++	st.d	$s1,$sp,32
++	st.d	$s2,$sp,24
++	addi.d	$sp,$sp,-64
++___
++$code.=<<___;
++	addi.d		$t0,$zero,-64
++	and		$sp,$sp,$t0
++	move		 $ctx,$a0		# reassigned argument
++	move		 $inp,$a1		# reassigned argument
++	move		 $num,$a2		# reassigned argument
++
++	slli.d		$num,$num,6
++	add.d		$num,$num,$inp
++	la.local	$t0,K_XX_XX
++	addi.d		$K_XX_XX,$t0,64
++
++	ld.w		$A,$ctx,0		# load context
++	ld.w		$B,$ctx,4
++	ld.w		$C,$ctx,8
++	ld.w		$D,$ctx,12
++	move		@T[0],$B		# magic seed
++	ld.w		$E,$ctx,16
++	move		@T[1],$C
++	xor		@T[1],@T[1],$D
++	and		@T[0],@T[0],@T[1]
++
++	vld		@X[2],$K_XX_XX,64	# pbswap mask
++	vld		$Kx,$K_XX_XX,-64	# K_00_19
++	vld		@X[-4&7],$inp,0		# load input to %xmm[0-3]
++	vld		@X[-3&7],$inp,16
++	vld		@X[-2&7],$inp,32
++	vld		@X[-1&7],$inp,48
++	vshuf.b		@X[-4&7],@X[2],@X[-4&7],@X[2]	# byte swap
++	addi.d		$inp,$inp,64
++	vshuf.b		@X[-3&7],@X[2],@X[-3&7],@X[2]
++	vshuf.b		@X[-2&7],@X[2],@X[-2&7],@X[2]
++	vshuf.b		@X[-1&7],@X[2],@X[-1&7],@X[2]
++	vadd.w		@X[0],@X[-4&7],$Kx	# add K_00_19
++	vadd.w		@X[1],@X[-3&7],$Kx
++	vadd.w		@X[2],@X[-2&7],$Kx
++	vst		@X[0],$sp,0		# X[]+K xfer to IALU
++	vst		@X[1],$sp,16
++	vst		@X[2],$sp,32
++	b		.Loop_lsx
++___
++
++sub Xupdate_lsx_16_31()		# recall that $Xi starts with 4
++{ use integer;
++  my $body = shift;
++  my @insns = (&$body,&$body,&$body,&$body);	# 40 instructions
++  my ($a,$b,$c,$d,$e);
++
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++	 &vbsrl_v(8,@X[-4&7],$vr16);	# compose "X[-14]" in "X[0]"
++	 &vbsll_v(8,@X[-3&7],$vr17);
++	 &vor_v($vr16,$vr17,@X[0]);
++
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++
++	 &vadd_w(@X[-1&7],$Kx,@Tx[1]);
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++	 &vbsrl_v(4,@X[-1&7],@Tx[0]);		# "X[-3]", 3 dwords
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++	 &vxor_v(@X[-4&7],@X[0],@X[0]);		# "X[0]"^="X[-16]"
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++
++	 &vxor_v(@X[-2&7],@Tx[0],@Tx[0]);	# "X[-3]"^"X[-8]"
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++
++	 &vxor_v(@Tx[0],@X[0],@X[0]);		# "X[0]"^="X[-3]"^"X[-8]"
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++	 &vst(eval(16*(($Xi-1)&3)),$sp,@Tx[1]);	# X[]+K xfer to IALU
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++
++	 &vsrli_w(31,@X[0],@Tx[0]);
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++
++	 &vbsll_v(12,@X[0],@Tx[2]);		# "X[0]"<<96, extract one dword
++	 &vadd_w(@X[0],@X[0],@X[0]);
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++
++	 &vsrli_w(30,@Tx[2],@Tx[1]);
++	 &vor_v(@Tx[0],@X[0],@X[0]);		# "X[0]"<<<=1
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++
++	 &vslli_w(2,@Tx[2],@Tx[2]);
++	 &vxor_v(@Tx[1],@X[0],@X[0]);
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++
++	 &vxor_v(@Tx[2],@X[0],@X[0]);		# "X[0]"^=("X[0]">>96)<<<2
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++	 &vld(eval(2*16*(($Xi)/5)-64),$K_XX_XX,$Kx)			if ($Xi%5==0);  # K_XX_XX
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++
++
++	 foreach (@insns) { eval; }	# remaining instructions [if any]
++
++  $Xi++;	push(@X,shift(@X));	# "rotate" X[]
++}
++
++sub Xupdate_lsx_32_79()
++{ use integer;
++  my $body = shift;
++  my @insns = (&$body,&$body,&$body,&$body);	# 32 to 44 instructions
++  my ($a,$b,$c,$d,$e);
++
++	 &vbsrl_v(8,@X[-2&7],$vr16);		# compose "X[-6]"
++	 &vbsll_v(8,@X[-1&7],$vr17);
++	 &vor_v($vr16,$vr17,@Tx[0]);
++
++	 &vxor_v(@X[-4&7],@X[0],@X[0]);		# "X[0]"="X[-32]"^"X[-16]"
++	 eval(shift(@insns));		# body_20_39
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++	 eval(shift(@insns));		# rol
++
++	 &vxor_v(@X[-7&7],@X[0],@X[0]);		# "X[0]"^="X[-28]"
++	 eval(shift(@insns));
++	 eval(shift(@insns))	if (@insns[0] !~ /&ro[rl]/);
++	 &vadd_w(@X[-1&7],$Kx,@Tx[1]);
++	 &vld(eval(2*16*($Xi/5)-64),$K_XX_XX,$Kx)	if ($Xi%5==0);
++	 eval(shift(@insns));		# ror
++	 eval(shift(@insns));
++
++	 &vxor_v(@Tx[0],@X[0],@X[0]);	# "X[0]"^="X[-6]"
++	 eval(shift(@insns));		# body_20_39
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++	 eval(shift(@insns));		# rol
++
++	 &vsrli_w(30,@X[0],@Tx[0]);
++	 &vst(eval(16*(($Xi-1)&3)),$sp,@Tx[1]);		# X[]+K xfer to IALU
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++	 eval(shift(@insns));		# ror
++	 eval(shift(@insns));
++
++	 &vslli_w(2,@X[0],@X[0]);
++	 eval(shift(@insns));		# body_20_39
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++	 eval(shift(@insns));		# rol
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++	 eval(shift(@insns));		# ror
++	 eval(shift(@insns));
++
++	 &vor_v(@Tx[0],@X[0],@X[0]);	# "X[0]"<<<=2
++	 eval(shift(@insns));		# body_20_39
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++	 eval(shift(@insns));		# rol
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++	 eval(shift(@insns));		# rol
++	 eval(shift(@insns));
++
++	 foreach (@insns) { eval; }	# remaining instructions
++
++  $Xi++;	push(@X,shift(@X));	# "rotate" X[]
++}
++
++sub Xuplast_lsx_80()
++{ use integer;
++  my $body = shift;
++  my @insns = (&$body,&$body,&$body,&$body);	# 32 instructions
++  my ($a,$b,$c,$d,$e);
++
++	 eval(shift(@insns));
++	 &vadd_w(@X[-1&7],$Kx,@Tx[1]);
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++
++	 &vst(eval(16*(($Xi-1)&3)),$sp,@Tx[1]);	# X[]+K xfer IALU
++
++	 foreach (@insns) { eval; }		# remaining instructions
++
++	 &beq($done_lsx_label,$inp,$num);
++
++	 &vld(64,$K_XX_XX,@X[2]);			# pbswap mask
++	 &vld(-64,$K_XX_XX,$Kx);			# K_00_19
++	 &vld(0,$inp,@X[-4&7]);				# load input
++	 &vld(16,$inp,@X[-3&7]);
++	 &vld(32,$inp,@X[-2&7]);
++	 &vld(48,$inp,@X[-1&7]);
++	 &vshuf_b(@X[2],@X[-4&7],@X[2],@X[-4&7]);	# byte swap
++	 &addi_d(64,$inp,$inp);
++
++  $Xi=0;
++}
++
++sub Xloop_lsx()
++{ use integer;
++  my $body = shift;
++  my @insns = (&$body,&$body,&$body,&$body);	# 32 instructions
++  my ($a,$b,$c,$d,$e);
++
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++	 &vshuf_b(@X[2],@X[($Xi-3)&7],@X[2],@X[($Xi-3)&7]);
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++	 &vadd_w($Kx,@X[($Xi-4)&7],@X[$Xi&7]);
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++	 &vst(eval(16*$Xi),$sp,@X[$Xi&7]);		# X[]+K xfer to IALU
++	 eval(shift(@insns));
++	 eval(shift(@insns));
++
++	foreach (@insns) { eval; }
++  $Xi++;
++}
++
++sub Xtail_lsx()
++{ use integer;
++  my $body = shift;
++  my @insns = (&$body,&$body,&$body,&$body);	# 32 instructions
++  my ($a,$b,$c,$d,$e);
++
++	foreach (@insns) { eval; }
++}
++
++$code.=<<___;
++.align	4
++.Loop_lsx:
++___
++	&Xupdate_lsx_16_31(\&body_00_19);
++	&Xupdate_lsx_16_31(\&body_00_19);
++	&Xupdate_lsx_16_31(\&body_00_19);
++	&Xupdate_lsx_16_31(\&body_00_19);
++	&Xupdate_lsx_32_79(\&body_00_19);
++	&Xupdate_lsx_32_79(\&body_20_39);
++	&Xupdate_lsx_32_79(\&body_20_39);
++	&Xupdate_lsx_32_79(\&body_20_39);
++	&Xupdate_lsx_32_79(\&body_20_39);
++	&Xupdate_lsx_32_79(\&body_20_39);
++	&Xupdate_lsx_32_79(\&body_40_59);
++	&Xupdate_lsx_32_79(\&body_40_59);
++	&Xupdate_lsx_32_79(\&body_40_59);
++	&Xupdate_lsx_32_79(\&body_40_59);
++	&Xupdate_lsx_32_79(\&body_40_59);
++	&Xupdate_lsx_32_79(\&body_20_39);
++	&Xuplast_lsx_80(\&body_20_39);	# can jump to "done"
++
++				$saved_j=$j; @saved_V=@V;
++
++	&Xloop_lsx(\&body_20_39);
++	&Xloop_lsx(\&body_20_39);
++	&Xloop_lsx(\&body_20_39);
++
++$code.=<<___;
++	ld.w	$t0,$ctx,0		# update context
++	add.w	$A,$A,$t0
++	ld.w    $t0,$ctx,4
++	add.w	@T[0],@T[0],$t0
++	ld.w	$t0,$ctx,8
++	add.w	$C,$C,$t0
++	ld.w    $t0,$ctx,12
++	add.w	$D,$D,$t0
++	st.w	$A,$ctx,0
++	ld.w	$t0,$ctx,16
++	add.w	$E,$E,$t0
++	st.w	@T[0],$ctx,4
++	move	$B,@T[0]			# magic seed
++	st.w	$C,$ctx,8
++	move	@T[1],$C
++	st.w	$D,$ctx,12
++	xor	@T[1],@T[1],$D
++	st.w	$E,$ctx,16
++	and	@T[0],@T[0],@T[1]
++	b	.Loop_lsx
++
++.align	4
++$done_lsx_label:
++___
++				$j=$saved_j; @V=@saved_V;
++
++	&Xtail_lsx(\&body_20_39);
++	&Xtail_lsx(\&body_20_39);
++	&Xtail_lsx(\&body_20_39);
++
++$code.=<<___;
++	#vzeroupper
++
++	ld.w	$t0,$ctx,0
++	add.w	$A,$A,$t0			# update context
++	ld.w	$t0,$ctx,4
++	add.w	@T[0],@T[0],$t0
++	ld.w	$t0,$ctx,8
++	add.w	$C,$C,$t0
++	st.w	$A,$ctx,0
++	ld.w	$t0,$ctx,12
++	add.w	$D,$D,$t0
++	st.w	@T[0],$ctx,4
++	ld.w	$t0,$ctx,16
++	add.w	$E,$E,$t0
++	st.w	$C,$ctx,8
++	st.w	$D,$ctx,12
++	st.w	$E,$ctx,16
++___
++$code.=<<___;
++	ld.d	$s4,$t7,56
++	ld.d	$fp,$t7,48
++	ld.d	$s0,$t7,40
++	ld.d	$s1,$t7,32
++	ld.d	$s2,$t7,24
++	move	$sp,$t7
++	addi.d	$sp,$sp,64
++.Lepilogue_lsx:
++	jr	$ra
++.size	sha1_block_data_order_lsx,.-sha1_block_data_order_lsx
++___
++
++}
++
++
++{
++use integer;
++$Xi=4;					# reset variables
++@X=map("\$xr$_",(4..7,0..3));
++@Tx=map("\$xr$_",(8..10));
++$Kx=$xr11;
++$j=0;
++
++my @ROTX=($t5,$fp,$s4,$a3,$a2,$a1);
++my ($ba5,$bt0)=($s0,$a0);
++
++my ($A,$F,$B,$C,$D,$E)=@ROTX;
++my $rx=0;
++my $frame=$s1;
++
++$code.=<<___;
++.align	4
++sha1_block_data_order_lasx:
++_lasx_shortcut:
++	addi.d      $sp,$sp,-56
++	addi.d      $t7,$sp,0
++	st.d        $ra,$sp,48
++	st.d        $fp,$sp,40
++	st.d        $s0,$sp,32
++	st.d        $s1,$sp,24
++	st.d        $s2,$sp,16
++	st.d        $s4,$sp,8
++	#vzeroupper
++	xvxor.v		$xr0,$xr0,$xr0
++	xvxor.v		$xr1,$xr0,$xr0
++	xvxor.v		$xr2,$xr0,$xr0
++	xvxor.v		$xr3,$xr0,$xr0
++	xvxor.v		$xr4,$xr0,$xr0
++	xvxor.v		$xr5,$xr0,$xr0
++	xvxor.v		$xr6,$xr0,$xr0
++	xvxor.v		$xr7,$xr0,$xr0
++	xvxor.v		$xr8,$xr0,$xr0
++	xvxor.v		$xr9,$xr0,$xr0
++	xvxor.v		$xr10,$xr0,$xr0
++	xvxor.v		$xr11,$xr0,$xr0
++	xvxor.v		$xr12,$xr0,$xr0
++	xvxor.v		$xr13,$xr0,$xr0
++	xvxor.v		$xr14,$xr0,$xr0
++	xvxor.v		$xr15,$xr0,$xr0
++	xvxor.v		$xr16,$xr0,$xr0
++	xvxor.v		$xr17,$xr0,$xr0
++___
++$code.=<<___;
++	move		 $ctx,$a0		# reassigned argument
++	move		 $inp,$a1		# reassigned argument
++	move		 $num,$a2		# reassigned argument
++
++	addi.d		$sp,$sp,-640
++	slli.d		$num,$num,6
++	addi.d		$frame,$inp,64
++	addi.d		$t0,$zero,-128
++	and		$sp,$sp,$t0
++	add.d		$num,$num,$inp
++	la.local	$t0,K_XX_XX
++	addi.d		$K_XX_XX,$t0,64
++
++	ld.w		$A,$ctx,0		# load context
++	#cmp		$num,$frame
++	#cmovae		$inp,$frame		#next or same block
++	bltu		$frame,$num,1f
++	move		$frame,$inp
++1:
++	ld.w		$F,$ctx,4
++	ld.w		$C,$ctx,8
++	ld.w		$D,$ctx,12
++	ld.w		$E,$ctx,16
++	xvld		@X[2],$K_XX_XX,64	# pbswap mask
++
++	vld		$vr0,$inp,0
++	vld		$vr1,$inp,16
++	vld		$vr2,$inp,32
++	vld		$vr3,$inp,48
++	addi.d		$inp,$inp,64
++	vld		$vr16,$frame,0
++	xvpermi.q	@X[-4&7],$xr16,2
++	vld		$vr16,$frame,16
++	xvpermi.q	@X[-3&7],$xr16,2
++	xvshuf.b 	@X[-4&7],@X[2],@X[-4&7],@X[2]
++	vld		$vr16,$frame,32
++	xvpermi.q       @X[-2&7],$xr16,2
++	xvshuf.b 	@X[-3&7],@X[2],@X[-3&7],@X[2]
++	vld		$vr16,$frame,48
++	xvpermi.q	@X[-1&7],$xr16,2
++	xvshuf.b 	@X[-2&7],@X[2],@X[-2&7],@X[2]
++	xvld		$Kx,$K_XX_XX,-64	# K_00_19
++	xvshuf.b 	@X[-1&7],@X[2],@X[-1&7],@X[2]
++
++	xvadd.w		@X[0],@X[-4&7],$Kx	# add K_00_19
++	xvadd.w  	@X[1],@X[-3&7],$Kx
++	xvst		@X[0],$sp,0		# X[]+K xfer to IALU
++	xvadd.w		@X[2],@X[-2&7],$Kx
++	xvst		@X[1],$sp,32
++	xvadd.w  	@X[3],@X[-1&7],$Kx
++	xvst		@X[2],$sp,64
++	xvst		@X[3],$sp,96
++___
++for (;$Xi<8;$Xi++) {	# Xupdate_lasx_16_31
++    use integer;
++
++	&xvbsrl_v(8,@X[-4&7],$xr16);		# compose "X[-14]" in "X[0]"
++	&xvbsll_v(8,@X[-3&7],$xr17);
++	&xvor_v($xr16,$xr17,@X[0]);
++	&xvbsrl_v(4,@X[-1&7],@Tx[0]);		# "X[-3]", 3 dwords
++	&xvxor_v(@X[-4&7],@X[0],@X[0]);		# "X[0]"^="X[-16]"
++	&xvxor_v(@X[-2&7],@Tx[0],@Tx[0]);	# "X[-3]"^"X[-8]"
++	&xvxor_v(@Tx[0],@X[0],@X[0]);		# "X[0]"^="X[-3]"^"X[-8]"
++	&xvsrli_w(31,@X[0],@Tx[0]);
++	&xvld(eval(2*16*(($Xi)/5)-64),$K_XX_XX,$Kx)		if ($Xi%5==0);	# K_XX_XX
++	&xvbsll_v(12,@X[0],@Tx[2]);		# "X[0]"<<96, extract one dword
++	&xvadd_w(@X[0],@X[0],@X[0]);
++	&xvsrli_w(30,@Tx[2],@Tx[1]);
++	&xvor_v	(@Tx[0],@X[0],@X[0]);		# "X[0]"<<<=1
++	&xvslli_w(2,@Tx[2],@Tx[2]);
++	&xvxor_v(@Tx[1],@X[0],@X[0]);
++	&xvxor_v(@Tx[2],@X[0],@X[0]);		# "X[0]"^=("X[0]">>96)<<<2
++	&xvadd_w($Kx,@X[0],@Tx[1]);
++	&xvst(32*$Xi,$sp,@Tx[1]);		# X[]+K xfer to IALU
++
++	push(@X,shift(@X));	# "rotate" X[]
++}
++$code.=<<___;
++	addi.d	$frame,$sp,128
++	b	.Loop_lasx
++.align	5
++.Loop_lasx:
++	rotri.w	$B,$F,2
++	andn	$bt0,$D,$F
++	and	$F,$F,$C
++	xor	$F,$F,$bt0
++___
++sub bodyx_00_19 () {	# 8 instructions, 3 cycles critical path
++	# at start $f=(b&c)^(~b&d), $b>>>=2
++	return &bodyx_20_39() if ($rx==19); $rx++;
++	(
++	'($a,$f,$b,$c,$d,$e)=@ROTX;'.
++
++	'&ld_w	((32*($j/4)+4*($j%4))%256-128,$frame,$t0);'.	# e+=X[i]+K
++	'&add_w	($t0,$e,$e);',
++	'&addi_d(256,$frame,$frame)	if ($j%32==31);',
++	'&andn	($a,$c,$bt0)',			# ~b&d for next round
++
++	'&add_w	($e,$f,$e)',			# e+=(b&c)^(~b&d)
++	'&rotri_w(27,$a,$ba5)',			# a<<<5
++	'&rotri_w(2,$a,$f)',			# b>>>2 for next round
++	'&and	($b,$a,$a)',			# b&c for next round
++
++	'&add_w	($e,$ba5,$e)',			# e+=a<<<5
++	'&xor	($bt0,$a,$a);'.			# f=(b&c)^(~b&d) for next round
++
++	'unshift(@ROTX,pop(@ROTX)); $j++;'
++	)
++}
++
++sub bodyx_20_39 () {	# 7 instructions, 2 cycles critical path
++	# on entry $f=b^c^d, $b>>>=2
++	return &bodyx_40_59() if ($rx==39); $rx++;
++	(
++	'($a,$f,$b,$c,$d,$e)=@ROTX;'.
++
++	'&ld_w ((32*($j/4)+4*($j%4))%256-128,$frame,$t0);'.		# e+=X[i]+K
++	'&add_w	($t0,$e,$e);',
++	'&addi_d(256,$frame,$frame)	if ($j%32==31);',
++
++	'&add_d	($f,$e,$e)',			# e+=b^c^d
++	'&rotri_w(27,$a,$ba5)',			# a<<<5
++	'&rotri_w(2,$a,$f)	if ($j<79)',	# b>>>2 in next round
++	'&xor	($b,$a,$a)	if ($j<79)',	# b^c for next round
++
++	'&add_w	($ba5,$e,$e)',			# e+=a<<<5
++	'&xor	($c,$a,$a)	if ($j<79);'.	# f=b^c^d for next round
++
++	'unshift(@ROTX,pop(@ROTX)); $j++;'
++	)
++}
++
++sub bodyx_40_59 () {	# 10 instructions, 3 cycles critical path
++	# on entry $f=((b^c)&(c^d)), $b>>>=2
++	$rx++;
++	(
++	'($a,$f,$b,$c,$d,$e)=@ROTX;'.
++
++	'&ld_w ((32*($j/4)+4*($j%4))%256-128,$frame,$t0);'.	# e+=X[i]+K
++	'&add_w	($t0,$e,$e);',
++
++	'&addi_d(256,$frame,$frame)	if ($j%32==31);',
++	'&xor	($c,$f,$f)	if ($j>39)',	# (b^c)&(c^d)^c
++	'&move	($b,$bt0)	if ($j<59)',	# count on zero latency
++	'&xor	($c,$bt0,$bt0)	if ($j<59)',	# c^d for next round
++
++	'&add_d	($e,$f,$e)',			# e+=(b^c)&(c^d)^c
++	'&rotri_w(27,$a,$ba5)',			# a<<<5
++	'&rotri_w(2,$a,$f)	if ($j<79)',	# b>>>2 in next round
++	'&xor	($b,$a,$a)',			# b^c for next round
++
++	'&add_w	($ba5,$e,$e)',			# e+=a<<<5
++	'&and	($bt0,$a,$a)	if ($j< 59);'.	# f=(b^c)&(c^d) for next round
++	'&xor	($c,$a,$a)	if ($j==59);'.	# f=b^c^d for next round
++
++	'unshift(@ROTX,pop(@ROTX)); $j++;'
++	)
++}
++
++sub Xupdate_lasx_16_31()		# recall that $Xi starts with 4
++{ use integer;
++  my $body = shift;
++  my @insns = (&$body,&$body,&$body,&$body,&$body);	# 35 instructions
++  my ($a,$b,$c,$d,$e);
++
++	&xvbsrl_v(8,@X[-4&7],$xr16);	# compose "X[-14]" in "X[0]"
++	&xvbsll_v(8,@X[-3&7],$xr17);
++	&xvor_v($xr16,$xr17,@X[0]);
++	eval(shift(@insns));
++	eval(shift(@insns));
++	eval(shift(@insns));
++	eval(shift(@insns));
++	eval(shift(@insns));
++
++	&xvbsrl_v(4,@X[-1&7],@Tx[0]);		# "X[-3]", 3 dwords
++	eval(shift(@insns));
++	eval(shift(@insns));
++	eval(shift(@insns));
++
++	&xvxor_v(@X[-4&7],@X[0],@X[0]);		# "X[0]"^="X[-16]"
++	&xvxor_v(@X[-2&7],@Tx[0],@Tx[0]);	# "X[-3]"^"X[-8]"
++	eval(shift(@insns));
++	eval(shift(@insns));
++
++	&xvxor_v(@Tx[0],@X[0],@X[0]);		# "X[0]"^="X[-3]"^"X[-8]"
++	eval(shift(@insns));
++	eval(shift(@insns));
++	eval(shift(@insns));
++	eval(shift(@insns));
++
++	&xvsrli_w(31,@X[0],@Tx[0]);
++	&xvld(eval(2*16*(($Xi)/5)-64),$K_XX_XX,$Kx)		if ($Xi%5==0);	# K_XX_XX
++	eval(shift(@insns));
++	eval(shift(@insns));
++	eval(shift(@insns));
++
++	&xvbsll_v(12,@X[0],@Tx[2]);		# "X[0]"<<96, extract one dword
++	&xvadd_w(@X[0],@X[0],@X[0]);
++	eval(shift(@insns));
++	eval(shift(@insns));
++
++	&xvsrli_w(30,@Tx[2],@Tx[1]);
++	&xvor_v	(@Tx[0],@X[0],@X[0]);		# "X[0]"<<<=1
++	eval(shift(@insns));
++	eval(shift(@insns));
++
++	&xvslli_w(2,@Tx[2],@Tx[2]);
++	&xvxor_v(@Tx[1],@X[0],@X[0]);
++	eval(shift(@insns));
++	eval(shift(@insns));
++
++	&xvxor_v(@Tx[2],@X[0],@X[0]);		# "X[0]"^=("X[0]">>96)<<<2
++	eval(shift(@insns));
++	eval(shift(@insns));
++	eval(shift(@insns));
++
++	&xvadd_w($Kx,@X[0],@Tx[1]);
++	eval(shift(@insns));
++	eval(shift(@insns));
++	eval(shift(@insns));
++	&xvst(32*$Xi,$sp,@Tx[1]);			# X[]+K xfer to IALU
++
++	foreach (@insns) { eval; }	# remaining instructions [if any]
++
++	$Xi++;
++	push(@X,shift(@X));	# "rotate" X[]
++}
++
++sub Xupdate_lasx_32_79()
++{ use integer;
++  my $body = shift;
++  my @insns = (&$body,&$body,&$body,&$body,&$body);	# 35 to 50 instructions
++  my ($a,$b,$c,$d,$e);
++
++	&xvbsrl_v(8,@X[-2&7],$xr16);		# compose "X[-6]"
++	&xvbsll_v(8,@X[-1&7],$xr17);
++	&xvor_v($xr16,$xr17,@Tx[0]);
++	&xvxor_v(@X[-4&7],@X[0],@X[0]);		# "X[0]"="X[-32]"^"X[-16]"
++	eval(shift(@insns));
++	eval(shift(@insns));
++	eval(shift(@insns));
++
++	&xvxor_v(@X[-7&7],@X[0],@X[0]);		# "X[0]"^="X[-28]"
++	&xvld(eval(2*16*($Xi/5)-64),$K_XX_XX,$Kx)	if ($Xi%5==0);
++	eval(shift(@insns));
++	eval(shift(@insns));
++	eval(shift(@insns));
++
++	&xvxor_v(@Tx[0],@X[0],@X[0]);	# "X[0]"^="X[-6]"
++	eval(shift(@insns));
++	eval(shift(@insns));
++	eval(shift(@insns));
++
++	&xvsrli_w(30,@X[0],@Tx[0]);
++	&xvslli_w(2,@X[0],@X[0]);
++	eval(shift(@insns));
++	eval(shift(@insns));
++	eval(shift(@insns));
++	eval(shift(@insns));   #debug
++
++	eval(shift(@insns));
++	eval(shift(@insns));
++	eval(shift(@insns));
++
++	&xvor_v(@Tx[0],@X[0],@X[0]);		# "X[0]"<<<=2
++	eval(shift(@insns));
++	eval(shift(@insns));
++	eval(shift(@insns));
++	eval(shift(@insns));
++	eval(shift(@insns));   #  debug
++
++	&xvadd_w($Kx,@X[0],@Tx[1]);
++	eval(shift(@insns));
++	eval(shift(@insns));
++	eval(shift(@insns));
++	eval(shift(@insns));
++
++	&xvst(32*$Xi,$sp,@Tx[1]);	# X[]+K xfer to IALU
++	foreach (@insns) { eval; }	# remaining instructions
++
++	$Xi++;
++	push(@X,shift(@X));	# "rotate" X[]
++}
++
++sub Xloop_lasx()
++{ use integer;
++  my $body = shift;
++  my @insns = (&$body,&$body,&$body,&$body,&$body);	# 32 instructions
++  my ($a,$b,$c,$d,$e);
++
++	 foreach (@insns) { eval; }
++}
++
++#&align32();
++	&Xupdate_lasx_32_79(\&bodyx_00_19);
++	&Xupdate_lasx_32_79(\&bodyx_00_19);
++	&Xupdate_lasx_32_79(\&bodyx_00_19);
++	&Xupdate_lasx_32_79(\&bodyx_00_19);
++
++	&Xupdate_lasx_32_79(\&bodyx_20_39);
++	&Xupdate_lasx_32_79(\&bodyx_20_39);
++	&Xupdate_lasx_32_79(\&bodyx_20_39);
++	&Xupdate_lasx_32_79(\&bodyx_20_39);
++
++#&align32();
++	&Xupdate_lasx_32_79(\&bodyx_40_59);
++	&Xupdate_lasx_32_79(\&bodyx_40_59);
++	&Xupdate_lasx_32_79(\&bodyx_40_59);
++	&Xupdate_lasx_32_79(\&bodyx_40_59);
++
++	&Xloop_lasx(\&bodyx_20_39);
++	&Xloop_lasx(\&bodyx_20_39);
++	&Xloop_lasx(\&bodyx_20_39);
++	&Xloop_lasx(\&bodyx_20_39);
++
++$code.=<<___;
++	addi.d	$frame,$inp,128
++	addi.d	$a0,$inp,128			# borrow $bt0
++	#cmp	$num,$frame
++	#cmovae	$inp,$frame
++	bltu	$frame,$num,2f
++	move	$frame,$inp
++
++	# output is d-e-[a]-f-b-c => A=d,F=e,C=f,D=b,E=c
++2:	ld.w	$t0,$ctx,0		# update context
++	add.w	@ROTX[0],@ROTX[0],$t0
++	ld.w	$t0,$ctx,4
++	add.w	@ROTX[1],@ROTX[1],$t0
++	ld.w	$t0,$ctx,8
++	add.w  @ROTX[3],@ROTX[3],$t0
++	st.w	@ROTX[0],$ctx,0
++	ld.w    $t0,$ctx,12
++	add.w	@ROTX[4],@ROTX[4],$t0
++	st.w	@ROTX[1],$ctx,4
++	move	$A,@ROTX[0]			# A=d
++	ld.w	$t0,$ctx,16
++	add.w  @ROTX[5],@ROTX[5],$t0
++	move	$ba5,@ROTX[3]
++	st.w	@ROTX[3],$ctx,8
++	move	$D,@ROTX[4]			# D=b
++	 #xchg	@ROTX[5],$F
++	st.w	@ROTX[4],$ctx,12
++	move	$F,@ROTX[1]			# F=e
++	st.w	@ROTX[5],$ctx,16
++	#mov	$F,16($ctx)
++	move	$E,@ROTX[5]			# E=c
++	move	$C,$ba5				# C=f
++	 #xchg	$F,$E				# E=c, F=e
++
++	beq	$num,$inp,.Ldone_lasx
++___
++
++$Xi=4;				# reset variables
++@X=map("\$xr$_",(4..7,0..3));
++
++$code.=<<___;
++	xvld	@X[2],$K_XX_XX,64		# pbswap mask
++	bltu	$num,$a0,.Last_lasx		# borrowed $bt0
++
++	vld		$vr0,$a0,-64		# low part of @X[-4&7]
++	vld		$vr1,$a0,-48
++	vld		$vr2,$a0,-32
++	vld		$vr3,$a0,-16
++	vld		$vr16,$frame,0
++	xvpermi.q	@X[-4&7],$xr16,2
++	vld		$vr16,$frame,16
++	xvpermi.q	@X[-3&7],$xr16,2
++	vld		$vr16,$frame,32
++	xvpermi.q	@X[-2&7],$xr16,2
++	vld		$vr16,$frame,48
++	xvpermi.q	@X[-1&7],$xr16,2
++	b		.Last_lasx
++
++.align	5
++.Last_lasx:
++	addi.d		$frame,$sp,144
++	rotri.w		$B,$F,2
++	andn		$bt0,$D,$F
++	and		$F,$F,$C
++	xor		$F,$F,$bt0
++	addi.d		$inp,$inp,128
++___
++	$rx=$j=0;	@ROTX=($A,$F,$B,$C,$D,$E);
++
++	&Xloop_lasx(\&bodyx_00_19);
++	&Xloop_lasx(\&bodyx_00_19);
++	&Xloop_lasx(\&bodyx_00_19);
++	&Xloop_lasx(\&bodyx_00_19);
++
++	&Xloop_lasx(\&bodyx_20_39);
++	&xvld(-64,$K_XX_XX,$Kx);		# K_00_19
++	&xvshuf_b(@X[2],@X[-4&7],@X[2],@X[-4&7]);	# byte swap
++	&Xloop_lasx(\&bodyx_20_39);
++	&xvshuf_b(@X[2],@X[-3&7],@X[2],@X[-3&7]);
++	&xvadd_w($Kx,@X[-4&7],@Tx[0]);		# add K_00_19
++	&Xloop_lasx(\&bodyx_20_39);
++	&xvst(0,$sp,@Tx[0]);
++	&xvshuf_b(@X[2],@X[-2&7],@X[2],@X[-2&7]);
++	&xvadd_w($Kx,@X[-3&7],@Tx[1]);
++	&Xloop_lasx(\&bodyx_20_39);
++	&xvst(32,$sp,@Tx[1]);
++	&xvshuf_b(@X[2],@X[-1&7],@X[2],@X[-1&7]);
++	&xvadd_w($Kx,@X[-2&7],@X[2]);
++
++	&Xloop_lasx(\&bodyx_40_59);
++#&align32	();
++	&xvst(64,$sp,@X[2]);
++	&xvadd_w($Kx,@X[-1&7],@X[3]);
++	&Xloop_lasx(\&bodyx_40_59);
++	&xvst(96,$sp,@X[3]);
++	&Xloop_lasx(\&bodyx_40_59);
++	&Xupdate_lasx_16_31(\&bodyx_40_59);
++
++	&Xupdate_lasx_16_31(\&bodyx_20_39);
++	&Xupdate_lasx_16_31(\&bodyx_20_39);
++	&Xupdate_lasx_16_31(\&bodyx_20_39);
++	&Xloop_lasx(\&bodyx_20_39);
++
++$code.=<<___;
++	addi.d	$frame,$sp,128
++
++	# output is d-e-[a]-f-b-c => A=d,F=e,C=f,D=b,E=c
++	ld.w	$t0,$ctx,0		# update context
++	add.w	@ROTX[0],@ROTX[0],$t0
++	ld.w    $t0,$ctx,4
++	add.w	@ROTX[1],@ROTX[1],$t0
++	ld.w    $t0,$ctx,8
++	add.w   @ROTX[3],@ROTX[3],$t0
++	st.w	@ROTX[0],$ctx,0
++	ld.w 	$t0,$ctx,12
++	add.w	@ROTX[4],@ROTX[4],$t0
++	st.w	@ROTX[1],$ctx,4
++	move	$A,@ROTX[0]			# A=d
++	ld.w	$t0,$ctx,16
++	add.w	@ROTX[5],@ROTX[5],$t0
++	move	$ba5,@ROTX[3]
++	st.w	@ROTX[3],$ctx,8
++	move	$D,@ROTX[4]			# D=b
++	 #xchg	@ROTX[5],$F			# F=c, C=f
++	st.w	@ROTX[4],$ctx,12
++	move	$F,@ROTX[1]			# F=e
++	st.w	@ROTX[5],$ctx,16
++	#mov	$F,16($ctx)
++	move	$E,@ROTX[5]			# E=c
++	move	$C,$ba5				# C=f
++
++	bgeu	$num,$inp,.Loop_lasx
++
++.Ldone_lasx:
++	#vzeroupper
++	xvxor.v		$xr0,$xr0,$xr0
++	xvxor.v		$xr1,$xr0,$xr0
++	xvxor.v		$xr2,$xr0,$xr0
++	xvxor.v		$xr3,$xr0,$xr0
++	xvxor.v		$xr4,$xr0,$xr0
++	xvxor.v		$xr5,$xr0,$xr0
++	xvxor.v		$xr6,$xr0,$xr0
++	xvxor.v		$xr7,$xr0,$xr0
++	xvxor.v		$xr8,$xr0,$xr0
++	xvxor.v		$xr9,$xr0,$xr0
++	xvxor.v		$xr10,$xr0,$xr0
++	xvxor.v		$xr11,$xr0,$xr0
++	xvxor.v		$xr12,$xr0,$xr0
++	xvxor.v		$xr13,$xr0,$xr0
++	xvxor.v		$xr14,$xr0,$xr0
++	xvxor.v		$xr15,$xr0,$xr0
++	xvxor.v		$xr16,$xr0,$xr0
++	xvxor.v		$xr17,$xr0,$xr0
++	move        $sp,$t7
++	ld.d        $ra,$sp,48
++	ld.d        $fp,$sp,40
++	ld.d        $s0,$sp,32
++	ld.d        $s1,$sp,24
++	ld.d        $s2,$sp,16
++	ld.d        $s4,$sp,8
++	addi.d      $sp,$sp,56
++	jirl        $zero,$ra,0
++___
++$code.=<<___;
++.Lepilogue_lasx:
++
++.size	sha1_block_data_order_lasx,.-sha1_block_data_order_lasx
++___
++}
++
++$code.=<<___;
++.align	6
++K_XX_XX:
++.long	0x5a827999,0x5a827999,0x5a827999,0x5a827999	# K_00_19
++.long	0x5a827999,0x5a827999,0x5a827999,0x5a827999	# K_00_19
++.long	0x6ed9eba1,0x6ed9eba1,0x6ed9eba1,0x6ed9eba1	# K_20_39
++.long	0x6ed9eba1,0x6ed9eba1,0x6ed9eba1,0x6ed9eba1	# K_20_39
++.long	0x8f1bbcdc,0x8f1bbcdc,0x8f1bbcdc,0x8f1bbcdc	# K_40_59
++.long	0x8f1bbcdc,0x8f1bbcdc,0x8f1bbcdc,0x8f1bbcdc	# K_40_59
++.long	0xca62c1d6,0xca62c1d6,0xca62c1d6,0xca62c1d6	# K_60_79
++.long	0xca62c1d6,0xca62c1d6,0xca62c1d6,0xca62c1d6	# K_60_79
++.long	0x00010203,0x04050607,0x08090a0b,0x0c0d0e0f	# pbswap mask
++.long	0x00010203,0x04050607,0x08090a0b,0x0c0d0e0f	# pbswap mask
++.byte	0xf,0xe,0xd,0xc,0xb,0xa,0x9,0x8,0x7,0x6,0x5,0x4,0x3,0x2,0x1,0x0
++___
++}}}
++
++{{{
++my @X=map("\$r$_",(8..15,23..31));	# a4-a7,s0-s11
++
++my $ctx=$a0;
++my $inp=$a1;
++my $num=$a2;
++my $A="\$r19";
++my $B="\$r17";
++my $C="\$r18";
++my $D="\$r7";
++my $E="\$r20";
++my @V=($A,$B,$C,$D,$E);
++my $t0="\$r16";
++my $t1=$num;
++my $t2="\$r22";
++
++sub BODY_00_14 {
++my ($i,$a,$b,$c,$d,$e)=@_;
++my $j=$i+1;
++$code.=<<___;
++	revb.2h	@X[$i],@X[$i]	# byte swap($i)
++	rotri.w	@X[$i],@X[$i],16
++
++___
++$code.=<<___;
++	add.w	$e,$e,$ra		# $i
++	xor	$t0,$c,$d
++	rotri.w	$t1,$a,27
++	and	$t0,$t0,$b
++	add.w	$e,$e,$t1
++	ld.w	@X[$j],$inp,$j*4
++	xor	$t0,$t0,$d
++	add.w	$e,$e,@X[$i]
++	rotri.w	$b,$b,2
++	add.w	$e,$e,$t0
++___
++}
++
++sub BODY_15_19 {
++my ($i,$a,$b,$c,$d,$e)=@_;
++my $j=$i+1;
++
++$code.=<<___	if ($i==15);
++	revb.2h @X[$i],@X[$i]   # byte swap($i)
++	rotri.w @X[$i],@X[$i],16
++
++___
++
++$code.=<<___;
++	add.w	$e,$e,$ra		# $i
++	xor	@X[$j%16],@X[$j%16],@X[($j+2)%16]
++	xor	$t0,$c,$d
++	rotri.w	$t1,$a,27
++	xor	@X[$j%16],@X[$j%16],@X[($j+8)%16]
++	and	$t0,$t0,$b
++	add.w	$e,$e,$t1
++	xor	@X[$j%16],@X[$j%16],@X[($j+13)%16]
++	xor	$t0,$t0,$d
++	add.w	$e,$e,@X[$i%16]
++	rotri.w	@X[$j%16],@X[$j%16],31
++	rotri.w	$b,$b,2
++	add.w	$e,$e,$t0
++
++___
++}
++
++sub BODY_20_39 {
++my ($i,$a,$b,$c,$d,$e)=@_;
++my $j=$i+1;
++$code.=<<___ if ($i<79);
++	xor	@X[$j%16],@X[$j%16],@X[($j+2)%16]
++	add.w	$e,$e,$ra		# $i
++	rotri.w	$t1,$a,27
++	xor	@X[$j%16],@X[$j%16],@X[($j+8)%16]
++	xor	$t0,$c,$d
++	add.w	$e,$e,$t1
++	xor	@X[$j%16],@X[$j%16],@X[($j+13)%16]
++	xor	$t0,$t0,$b
++	add.w	$e,$e,@X[$i%16]
++	rotri.w	@X[$j%16],@X[$j%16],31
++	rotri.w	$b,$b,2
++	add.w	$e,$e,$t0
++
++___
++$code.=<<___ if ($i==79);
++	ld.w	@X[0],$ctx,0
++	add.w	$e,$e,$ra		# $i
++	ld.w	@X[1],$ctx,4
++	rotri.w	$t1,$a,27
++	ld.w	@X[2],$ctx,8
++	xor	$t0,$c,$d
++	add.w	$e,$e,$t1
++	ld.w	@X[3],$ctx,12
++	xor	$t0,$t0,$b
++	add.w	$e,$e,@X[$i%16]
++	ld.w	@X[4],$ctx,16
++	rotri.w	$b,$b,2
++	add.w	$e,$e,$t0
++
++___
++}
++
++sub BODY_40_59 {
++my ($i,$a,$b,$c,$d,$e)=@_;
++my $j=$i+1;
++$code.=<<___ if ($i<79);
++	add.w	$e,$e,$ra		# $i
++	and	$t0,$c,$d
++	xor	@X[$j%16],@X[$j%16],@X[($j+2)%16]
++	rotri.w	$t1,$a,27
++	add.w	$e,$e,$t0
++	xor	@X[$j%16],@X[$j%16],@X[($j+8)%16]
++	xor	$t0,$c,$d
++	add.w	$e,$e,$t1
++	xor	@X[$j%16],@X[$j%16],@X[($j+13)%16]
++	and	$t0,$t0,$b
++	add.w   $e,$e,@X[$i%16]
++	rotri.w @X[$j%16],@X[$j%16],31
++	rotri.w $b,$b,2
++	add.w   $e,$e,$t0
++
++___
++}
++
++$code.=<<___;
++
++.align  5
++sha1_block_data_order_la:
++_la_shortcut:
++	addi.d  $sp,$sp,-16*$SZREG
++	$REG_S	$ra,$sp,10*$SZREG
++	$REG_S	$fp,$sp,9*$SZREG
++	$REG_S	$s7,$sp,8*$SZREG
++	$REG_S	$s6,$sp,7*$SZREG
++	$REG_S	$s5,$sp,6*$SZREG
++	$REG_S	$s4,$sp,5*$SZREG
++	$REG_S	$s3,$sp,4*$SZREG
++	$REG_S	$s2,$sp,3*$SZREG
++	$REG_S	$s1,$sp,2*$SZREG
++	$REG_S	$s0,$sp,1*$SZREG
++___
++$code.=<<___;
++	slli.d  $num,$num,6
++	add.d   $num,$num,$inp
++	$REG_S	$num,$sp,0
++	ld.w	$A,$ctx,0
++	ld.w	$B,$ctx,4
++	ld.w	$C,$ctx,8
++	ld.w	$D,$ctx,12
++	ld.w	$E,$ctx,16
++	b       .Loop
++
++.Loop:
++	li.d    $ra,0x5a827999
++	ld.w	@X[0],$inp,0
++___
++for ($i=0;$i<15;$i++)	{ &BODY_00_14($i,@V); unshift(@V,pop(@V)); }
++for (;$i<20;$i++)	{ &BODY_15_19($i,@V); unshift(@V,pop(@V)); }
++$code.=<<___;
++	li.d    $ra,0x6ed9eba1
++___
++for (;$i<40;$i++)	{ &BODY_20_39($i,@V); unshift(@V,pop(@V)); }
++$code.=<<___;
++	li.d    $ra,0x8f1bbcdc
++___
++for (;$i<60;$i++)	{ &BODY_40_59($i,@V); unshift(@V,pop(@V)); }
++$code.=<<___;
++	li.d	$ra,0xca62c1d6
++___
++for (;$i<80;$i++)	{ &BODY_20_39($i,@V); unshift(@V,pop(@V)); }
++$code.=<<___;
++	addi.d  $inp,$inp,64
++	$REG_L	$num,$sp,0
++
++	add.w	$A,$A,$X[0]
++	add.w	$B,$B,$X[1]
++	st.w	$A,$ctx,0
++	add.w	$C,$C,$X[2]
++	add.w	$D,$D,$X[3]
++	st.w	$B,$ctx,4
++	add.w	$E,$E,$X[4]
++	st.w	$C,$ctx,8
++	st.w	$D,$ctx,12
++	st.w	$E,$ctx,16
++	bne	$inp,$num,.Loop
++
++	$REG_L	$ra,$sp,10*$SZREG
++	$REG_L	$fp,$sp,9*$SZREG
++	$REG_L	$s7,$sp,8*$SZREG
++	$REG_L	$s6,$sp,7*$SZREG
++	$REG_L	$s5,$sp,6*$SZREG
++	$REG_L	$s4,$sp,5*$SZREG
++	$REG_L	$s3,$sp,4*$SZREG
++	$REG_L	$s2,$sp,3*$SZREG
++	$REG_L	$s1,$sp,2*$SZREG
++	$REG_L	$s0,$sp,1*$SZREG
++___
++$code.=<<___;
++	addi.d  $sp,$sp,16*$SZREG
++	jr      $ra
++
++___
++
++}}}
++
++$code.=<<___;
++.asciz	"SHA1 block transform for LoongArch64, CRYPTOGAMS by <appro\@openssl.org>"
++.align	6
++___
++
++$code =~ s/\`([^\`]*)\`/eval($1)/gem;
++
++print $code;
++
++close STDOUT or die "error closing STDOUT: $!";
+diff --git a/crypto/sha/asm/sha512-loongarch.pl b/crypto/sha/asm/sha512-loongarch.pl
+deleted file mode 100644
+index 2566d11..0000000
+--- a/crypto/sha/asm/sha512-loongarch.pl
++++ /dev/null
+@@ -1,342 +0,0 @@
+-#! /usr/bin/env perl
+-# Copyright 2010-2018 The OpenSSL Project Authors. All Rights Reserved.
+-#
+-# Licensed under the OpenSSL license (the "License").  You may not use
+-# this file except in compliance with the License.  You can obtain a copy
+-# in the file LICENSE in the source distribution or at
+-# https://www.openssl.org/source/license.html
+-
+-
+-# ====================================================================
+-# Written by lujinfeng & shichenlong & songding <lujinfeng@loongson.cn>
+-# & <shichenlong@loongson.cn> & <songding@loongson.cn> for the OpenSSL
+-# project. The module is, however, dual licensed under OpenSSL and
+-# CRYPTOGAMS licenses depending on where you obtain it. For further
+-# details see http://www.openssl.org/~appro/cryptogams/.
+-# ====================================================================
+-
+-# SHA for LoongArch.
+-#
+-# June 2022
+-#
+-# SHA256 performance improvement on LoobgArch  is ~37% over gcc-
+-# generated code in n32/64 build. SHA512 [which for now can be
+-# compiled for LoongArch ISA] improvement is modest ~18%, but
+-# it comes for free, because it's same instruction sequence.
+-# Improvement coefficients are for aligned input.
+-
+-######################################################################
+-# There is a number of LoongArch ABI in use. It appears that if
+-# one picks the latter, it's possible to arrange code in ABI neutral
+-# manner. Therefore let's stick to LoongArch register layout:
+-#
+-($zero,$ra,$tp,$sp,$fp)=map("\$r$_",(0..3,22));
+-($a0,$a1,$a2,$a3,$a4,$a5,$a6,$a7)=map("\$r$_",(4..11));
+-($t0,$t1,$t2,$t3,$t4,$t5,$t6,$t7,$t8,$x)=map("\$r$_",(12..21));
+-($s0,$s1,$s2,$s3,$s4,$s5,$s6,$s7,$s8)=map("\$r$_",(23..31));
+-#
+-# The return value is placed in $a0. Following coding rules facilitate
+-# interoperability:
+-
+-        $REG_S="st.d";
+-        $REG_L="ld.d";
+-        $SZREG=8;
+-#
+-# <appro@openssl.org>
+-#
+-######################################################################
+-
+-
+-for (@ARGV) {	$output=$_ if (/\w[\w\-]*\.\w+$/);	}
+-open STDOUT,">$output";
+-
+-if (!defined($big_endian)) { $big_endian=(unpack('L',pack('N',1))==1); }
+-
+-if ($output =~ /512/) {
+-        $label="512";
+-        $SZ=8;
+-        $LD="ld.d";             # load from memory
+-        $ST="st.d";             # store to memory
+-        $SLL="slli.d";          # shift left logical
+-        $SRL="srli.d";          # shift right logical
+-        $ADD="add.d";
+-        $ROTR="rotri.d";
+-        @Sigma0=(28,34,39);
+-        @Sigma1=(14,18,41);
+-        @sigma0=( 7, 1, 8);     # right shift first
+-        @sigma1=( 6,19,61);     # right shift first
+-        $lastK=0x817;
+-        $rounds=80;
+-} else {
+-        $label="256";
+-        $SZ=4;
+-        $LD="ld.w";             # load from memory
+-        $ST="st.w";             # store to memory
+-        $SLL="slli.w";          # shift left logical
+-        $SRL="srli.w";          # shift right logical
+-        $ADD="add.w";
+-        $ROTR="rotri.w";
+-        @Sigma0=( 2,13,22);
+-        @Sigma1=( 6,11,25);
+-        @sigma0=( 3, 7,18);     # right shift first
+-        @sigma1=(10,17,19);     # right shift first
+-        $lastK=0x8f2;
+-        $rounds=64;
+-}
+-
+-($A,$B,$C,$D,$E,$F,$G,$H)=map("\$r$_",(1,7,16,17,18,19,20,22));
+-@X=map("\$r$_",(8..15,23..30));
+-@V=($F,$D,$E,$B,$G,$C,$H,$A);
+-
+-$ctx=$a0;
+-$inp=$a1;
+-$len=$a2;
+-$Ktbl=$len;
+-
+-sub BODY_00_15 {
+-my ($i,$a,$b,$c,$d,$e,$f,$g,$h)=@_;
+-my ($T1,$tmp0,$tmp1,$tmp2)=(@X[4],@X[5],@X[6],@X[7]);
+-
+-$code.=<<___ if ($i<15);
+-        ${LD}   @X[1],$inp,($i+1)*$SZ
+-___
+-$code.=<<___    if (!$big_endian && $i<16 && $SZ==4);
+-        revb.2h @X[0],@X[0]             # byte swap($i)
+-        rotri.w @X[0],@X[0],16
+-___
+-$code.=<<___    if (!$big_endian && $i<16 && $SZ==8);
+-        revb.4h @X[0],@X[0]             # byte swap($i)
+-        revh.d  @X[0],@X[0]
+-___
+-$code.=<<___;
+-        xor     $tmp2,$f,$g                     # $i
+-        $ROTR   $tmp0,$e,@Sigma1[0]
+-        $ADD    $T1,$X[0],$h
+-        $ROTR   $tmp1,$e,@Sigma1[1]
+-        and     $tmp2,$tmp2,$e
+-        $ROTR   $h,$e,@Sigma1[2]
+-        xor     $tmp0,$tmp0,$tmp1
+-        $ROTR   $tmp1,$a,@Sigma0[0]
+-        xor     $tmp2,$tmp2,$g                  # Ch(e,f,g)
+-        xor     $tmp0,$tmp0,$h                  # Sigma1(e)
+-
+-        $ROTR   $h,$a,@Sigma0[1]
+-        $ADD    $T1,$T1,$tmp2
+-        $LD     $tmp2,$Ktbl,$i*$SZ              # K[$i]
+-        xor     $h,$h,$tmp1
+-        $ROTR   $tmp1,$a,@Sigma0[2]
+-        $ADD    $T1,$T1,$tmp0
+-        and     $tmp0,$b,$c
+-        xor     $h,$h,$tmp1                     # Sigma0(a)
+-        xor     $tmp1,$b,$c
+-
+-        $ST     @X[0],$sp,($i%16)*$SZ           # offload to ring buffer
+-        $ADD    $h,$h,$tmp0
+-        and     $tmp1,$tmp1,$a
+-        $ADD    $T1,$T1,$tmp2                   # +=K[$i]
+-        $ADD    $h,$h,$tmp1                     # +=Maj(a,b,c)
+-        $ADD    $d,$d,$T1
+-        $ADD    $h,$h,$T1
+-___
+-$code.=<<___ if ($i>=13);
+-        $LD     @X[3],$sp,(($i+3)%16)*$SZ       # prefetch from ring buffer
+-___
+-}
+-
+-sub BODY_16_XX {
+-my $i=@_[0];
+-my ($tmp0,$tmp1,$tmp2,$tmp3)=(@X[4],@X[5],@X[6],@X[7]);
+-
+-$code.=<<___;
+-        $SRL    $tmp2,@X[1],@sigma0[0]                  # Xupdate($i)
+-        $ROTR   $tmp0,@X[1],@sigma0[1]
+-        $ADD    @X[0],@X[0],@X[9]                       # +=X[i+9]
+-        xor     $tmp2,$tmp2,$tmp0
+-        $ROTR   $tmp0,@X[1],@sigma0[2]
+-
+-        $SRL    $tmp3,@X[14],@sigma1[0]
+-        $ROTR   $tmp1,@X[14],@sigma1[1]
+-        xor     $tmp2,$tmp2,$tmp0                       # sigma0(X[i+1])
+-        $ROTR   $tmp0,@X[14],@sigma1[2]
+-        xor     $tmp3,$tmp3,$tmp1
+-        $ADD    @X[0],@X[0],$tmp2
+-        xor     $tmp3,$tmp3,$tmp0                       # sigma1(X[i+14])
+-        $ADD    @X[0],@X[0],$tmp3
+-___
+-        &BODY_00_15(@_);
+-}
+-
+-$FRAMESIZE=16*$SZ+16*$SZREG;
+-
+-$code.=<<___;
+-.align 5
+-.globl sha${label}_block_data_order
+-sha${label}_block_data_order:
+-___
+-$code.=<<___;
+-        addi.d  $sp,$sp,-$FRAMESIZE
+-        $REG_S  $ra,$sp,$FRAMESIZE-1*$SZREG
+-        $REG_S  $fp,$sp,$FRAMESIZE-2*$SZREG
+-        $REG_S  $s7,$sp,$FRAMESIZE-3*$SZREG
+-        $REG_S  $s6,$sp,$FRAMESIZE-4*$SZREG
+-        $REG_S  $s5,$sp,$FRAMESIZE-5*$SZREG
+-        $REG_S  $s4,$sp,$FRAMESIZE-6*$SZREG
+-        $REG_S  $s3,$sp,$FRAMESIZE-7*$SZREG
+-        $REG_S  $s2,$sp,$FRAMESIZE-8*$SZREG
+-        $REG_S  $s1,$sp,$FRAMESIZE-9*$SZREG
+-        $REG_S  $s0,$sp,$FRAMESIZE-10*$SZREG
+-___
+-$code.=<<___;
+-        slli.d  @X[15],$len,`log(16*$SZ)/log(2)`
+-___
+-$code.=<<___;
+-        la.local        $Ktbl,K${label}         # PIC-ified 'load address'
+-
+-        $LD     $A,$ctx,7*$SZ
+-        $LD     $B,$ctx,3*$SZ
+-        $LD     $C,$ctx,5*$SZ
+-        $LD     $D,$ctx,1*$SZ
+-        $LD     $E,$ctx,2*$SZ
+-        $LD     $F,$ctx,0*$SZ                   # load context
+-        $LD     $G,$ctx,4*$SZ
+-        $LD     $H,$ctx,6*$SZ
+-
+-        add.d   @X[15],@X[15],$inp              # pointer to the end of input
+-        $REG_S  @X[15],$sp,16*$SZ
+-        b       .Loop
+-
+-.align	5
+-.Loop:
+-        ${LD}   @X[0],$inp,0
+-___
+-for ($i=0;$i<16;$i++)
+-{ &BODY_00_15($i,@V); unshift(@V,pop(@V)); push(@X,shift(@X)); }
+-$code.=<<___;
+-        b       .L16_xx
+-.align	4
+-.L16_xx:
+-___
+-for (;$i<32;$i++)
+-{ &BODY_16_XX($i,@V); unshift(@V,pop(@V)); push(@X,shift(@X)); }
+-$code.=<<___;
+-        andi    @X[6],@X[6],0xfff
+-        li.d    @X[7],$lastK
+-        addi.d  $Ktbl,$Ktbl,16*$SZ              # Ktbl+=16
+-        bne     @X[6],@X[7],.L16_xx
+-
+-        $REG_L  @X[15],$sp,16*$SZ               # restore pointer to the end of input
+-        $LD     @X[0],$ctx,0*$SZ
+-        $LD     @X[1],$ctx,1*$SZ
+-        $LD     @X[2],$ctx,2*$SZ
+-        addi.d  $inp,$inp,16*$SZ
+-        $LD     @X[3],$ctx,3*$SZ
+-        $ADD    $F,$F,@X[0]
+-        $LD     @X[4],$ctx,4*$SZ
+-        $ADD    $D,$D,@X[1]
+-        $LD     @X[5],$ctx,5*$SZ
+-        $ADD    $E,$E,@X[2]
+-        $LD     @X[6],$ctx,6*$SZ
+-        $ADD    $B,$B,@X[3]
+-        $LD     @X[7],$ctx,7*$SZ
+-        $ADD    $G,$G,@X[4]
+-        $ST     $F,$ctx,0*$SZ
+-        $ADD    $C,$C,@X[5]
+-        $ST     $D,$ctx,1*$SZ
+-        $ADD    $H,$H,@X[6]
+-        $ST     $E,$ctx,2*$SZ
+-        $ADD    $A,$A,@X[7]
+-        $ST     $B,$ctx,3*$SZ
+-        $ST     $G,$ctx,4*$SZ
+-        $ST     $C,$ctx,5*$SZ
+-        $ST     $H,$ctx,6*$SZ
+-        $ST     $A,$ctx,7*$SZ
+-
+-        addi.d  $Ktbl,$Ktbl,`(16-$rounds)*$SZ`  # rewind $Ktbl
+-        bne     $inp,@X[15],.Loop
+-
+-        $REG_L  $ra,$sp,$FRAMESIZE-1*$SZREG
+-        $REG_L  $fp,$sp,$FRAMESIZE-2*$SZREG
+-        $REG_L  $s7,$sp,$FRAMESIZE-3*$SZREG
+-        $REG_L  $s6,$sp,$FRAMESIZE-4*$SZREG
+-        $REG_L  $s5,$sp,$FRAMESIZE-5*$SZREG
+-        $REG_L  $s4,$sp,$FRAMESIZE-6*$SZREG
+-        $REG_L  $s3,$sp,$FRAMESIZE-7*$SZREG
+-        $REG_L  $s2,$sp,$FRAMESIZE-8*$SZREG
+-        $REG_L  $s1,$sp,$FRAMESIZE-9*$SZREG
+-        $REG_L  $s0,$sp,$FRAMESIZE-10*$SZREG
+-___
+-$code.=<<___;
+-        addi.d  $sp,$sp,$FRAMESIZE
+-        jr      $ra
+-
+-.section .rodata
+-.align	5
+-K${label}:
+-___
+-if ($SZ==4) {
+-$code.=<<___;
+-        .word	0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5
+-        .word	0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5
+-        .word	0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3
+-        .word	0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174
+-        .word	0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc
+-        .word	0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da
+-        .word	0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7
+-        .word	0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967
+-        .word	0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13
+-        .word	0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85
+-        .word	0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3
+-        .word	0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070
+-        .word	0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5
+-        .word	0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3
+-        .word	0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208
+-        .word	0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+-___
+-} else {
+-$code.=<<___;
+-        .dword	0x428a2f98d728ae22, 0x7137449123ef65cd
+-        .dword	0xb5c0fbcfec4d3b2f, 0xe9b5dba58189dbbc
+-        .dword	0x3956c25bf348b538, 0x59f111f1b605d019
+-        .dword	0x923f82a4af194f9b, 0xab1c5ed5da6d8118
+-        .dword	0xd807aa98a3030242, 0x12835b0145706fbe
+-        .dword	0x243185be4ee4b28c, 0x550c7dc3d5ffb4e2
+-        .dword	0x72be5d74f27b896f, 0x80deb1fe3b1696b1
+-        .dword	0x9bdc06a725c71235, 0xc19bf174cf692694
+-        .dword	0xe49b69c19ef14ad2, 0xefbe4786384f25e3
+-        .dword	0x0fc19dc68b8cd5b5, 0x240ca1cc77ac9c65
+-        .dword	0x2de92c6f592b0275, 0x4a7484aa6ea6e483
+-        .dword	0x5cb0a9dcbd41fbd4, 0x76f988da831153b5
+-        .dword	0x983e5152ee66dfab, 0xa831c66d2db43210
+-        .dword	0xb00327c898fb213f, 0xbf597fc7beef0ee4
+-        .dword	0xc6e00bf33da88fc2, 0xd5a79147930aa725
+-        .dword	0x06ca6351e003826f, 0x142929670a0e6e70
+-        .dword	0x27b70a8546d22ffc, 0x2e1b21385c26c926
+-        .dword	0x4d2c6dfc5ac42aed, 0x53380d139d95b3df
+-        .dword	0x650a73548baf63de, 0x766a0abb3c77b2a8
+-        .dword	0x81c2c92e47edaee6, 0x92722c851482353b
+-        .dword	0xa2bfe8a14cf10364, 0xa81a664bbc423001
+-        .dword	0xc24b8b70d0f89791, 0xc76c51a30654be30
+-        .dword	0xd192e819d6ef5218, 0xd69906245565a910
+-        .dword	0xf40e35855771202a, 0x106aa07032bbd1b8
+-        .dword	0x19a4c116b8d2d0c8, 0x1e376c085141ab53
+-        .dword	0x2748774cdf8eeb99, 0x34b0bcb5e19b48a8
+-        .dword	0x391c0cb3c5c95a63, 0x4ed8aa4ae3418acb
+-        .dword	0x5b9cca4f7763e373, 0x682e6ff3d6b2b8a3
+-        .dword	0x748f82ee5defb2fc, 0x78a5636f43172f60
+-        .dword	0x84c87814a1f0ab72, 0x8cc702081a6439ec
+-        .dword	0x90befffa23631e28, 0xa4506cebde82bde9
+-        .dword	0xbef9a3f7b2c67915, 0xc67178f2e372532b
+-        .dword	0xca273eceea26619c, 0xd186b8c721c0c207
+-        .dword	0xeada7dd6cde0eb1e, 0xf57d4f7fee6ed178
+-        .dword	0x06f067aa72176fba, 0x0a637dc5a2c898a6
+-        .dword	0x113f9804bef90dae, 0x1b710b35131c471b
+-        .dword	0x28db77f523047d84, 0x32caab7b40c72493
+-        .dword	0x3c9ebe0a15c9bebc, 0x431d67c49c100d4c
+-        .dword	0x4cc5d4becb3e42b6, 0x597f299cfc657e2a
+-        .dword	0x5fcb6fab3ad6faec, 0x6c44198c4a475817
+-___
+-}
+-
+-$code =~ s/\`([^\`]*)\`/eval $1/gem;
+-print $code;
+-close STDOUT;
+\ No newline at end of file
+diff --git a/crypto/sha/asm/sha512-loongarch64.pl b/crypto/sha/asm/sha512-loongarch64.pl
+new file mode 100755
+index 0000000..29957b5
+--- /dev/null
++++ b/crypto/sha/asm/sha512-loongarch64.pl
+@@ -0,0 +1,1560 @@
++#! /usr/bin/env perl
++# Copyright 2010-2018 The OpenSSL Project Authors. All Rights Reserved.
++#
++# Licensed under the OpenSSL license (the "License").  You may not use
++# this file except in compliance with the License.  You can obtain a copy
++# in the file LICENSE in the source distribution or at
++# https://www.openssl.org/source/license.html
++
++
++# ====================================================================
++# Written by zhuchen & lujinfeng & shichenlong & songding
++# <zhuchen@loongson.cn> & <lujinfeng@loongson.cn>
++# & <shichenlong@loongson.cn> & <songding@loongson.cn> for the OpenSSL
++# project. The module is, however, dual licensed under OpenSSL and
++# CRYPTOGAMS licenses depending on where you obtain it. For further
++# details see http://www.openssl.org/~appro/cryptogams/.
++# ====================================================================
++
++# SHA for LoongArch.
++#
++# January 2023
++#
++# SHA256 performance improvement on LoobgArch  is ~37% over gcc-
++# generated code in n32/64 build. SHA512 [which for now can be
++# compiled for LoongArch ISA] improvement is modest ~18%, but
++# it comes for free, because it's same instruction sequence.
++# Improvement coefficients are for aligned input.
++
++######################################################################
++# There is a number of LoongArch ABI in use. It appears that if
++# one picks the latter, it's possible to arrange code in ABI neutral
++# manner. Therefore let's stick to LoongArch register layout:
++#
++
++
++($zero,$ra,$tp,$sp,$fp)=map("\$r$_",(0..3,22));
++($a0,$a1,$a2,$a3,$a4,$a5,$a6,$a7)=map("\$r$_",(4..11));
++($t0,$t1,$t2,$t3,$t4,$t5,$t6,$t7,$t8,$x)=map("\$r$_",(12..21));
++($s0,$s1,$s2,$s3,$s4,$s5,$s6,$s7,$s8)=map("\$r$_",(23..31));
++($vr0,$vr1,$vr2,$vr3,$vr4,$vr5,$vr6,$vr7,$vr8,$vr9,$vr10,$vr11,$vr12,$vr13,$vr14,$vr15,$vr16,$vr17,$vr18,$vr19)=map("\$vr$_",(0..19));
++($xr0,$xr1,$xr2,$xr3,$xr4,$xr5,$xr6,$xr7,$xr8,$xr9,$xr10,$xr11,$xr12,$xr13,$xr14,$xr15,$xr16,$xr17,$xr18,$xr19)=map("\$xr$_",(0..19));
++
++
++for (@ARGV) {	$output=$_ if (/\w[\w\-]*\.\w+$/);	}
++open STDOUT,">$output";
++
++
++if ($output =~ /512/) {
++	$func="sha512_block_data_order";
++	$TABLE="K512";
++	$SZ=8;
++	@ROT=($A,$B,$C,$D,$E,$F,$G,$H)=($t5,$s4,$a3,$a2,$a4,$a5,$a6,$a7);
++	($BT1,$ba0,$ba1,$ba2,$ba3)=($s0,$s1,$s2,$s3,$a0);
++	@Sigma0=(28,34,39);
++	@Sigma1=(14,18,41);
++	@sigma0=(1,  8, 7);
++	@sigma1=(19,61, 6);
++	$rounds=80;
++	$ADD="add.d";
++	$ST="st.d";
++	$LD="ld.d";
++        $ROTR="rotri.d";
++        $SLL="slli.d";          # shift left logical
++        $SRL="srli.d";          # shift right logical
++        $lastK=0x817;
++} else {
++	$func="sha256_block_data_order";
++	$TABLE="K256";
++	$SZ=4;
++	@ROT=($A,$B,$C,$D,$E,$F,$G,$H)=($t5,$s4,$a3,$a2,$a4,$a5,$a6,$a7);
++	($BT1,$ba0,$ba1,$ba2,$ba3)=($s0,$s1,$s2,$s3,$a0);
++	@Sigma0=( 2,13,22);
++	@Sigma1=( 6,11,25);
++	@sigma0=( 7,18, 3);
++	@sigma1=(17,19,10);
++	$rounds=64;
++	$ADD="add.w";
++	$ST="st.w";
++	$LD="ld.w";
++        $ROTR="rotri.w";
++        $SLL="slli.w";          # shift left logical
++        $SRL="srli.w";          # shift right logical
++        $lastK=0x8f2;
++}
++
++$ctx=$a0;	# 1st arg, zapped by $ba3
++$inp=$a1;	# 2nd arg
++$Tbl=$fp;
++
++$SZREG=8;
++$FRAMESIZE=16*$SZ+16*$SZREG;
++$REG_S="st.d";
++$REG_L="ld.d";
++
++$code=<<___;
++.text
++
++.extern	OPENSSL_loongarchcap_P
++.globl	$func
++.align	4
++$func:
++___
++$code.=<<___;
++	la.local	$t0,OPENSSL_loongarchcap_P
++	ld.w		$t1,$t0,0
++	addi.w		$t2,$zero,1
++	slli.w		$t3,$t2,7
++	and		$t4,$t3,$t1
++	bne		$t4,$zero,.Llasx_shortcut
++	slli.w		$t3,$t2,6
++	and		$t4,$t3,$t1
++	bne		$t4,$zero,.Llsx_shortcut
++	b		.Lla_shortcut
++___
++
++
++if ($SZ==4) {
++$code.=<<___;
++.align	6
++.type	$TABLE,\@object
++$TABLE:
++	.long	0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5
++	.long	0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5
++	.long	0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5
++	.long	0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5
++	.long	0xd807aa98,0x12835b01,0x243185be,0x550c7dc3
++	.long	0xd807aa98,0x12835b01,0x243185be,0x550c7dc3
++	.long	0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174
++	.long	0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174
++	.long	0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc
++	.long	0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc
++	.long	0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da
++	.long	0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da
++	.long	0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7
++	.long	0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7
++	.long	0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967
++	.long	0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967
++	.long	0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13
++	.long	0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13
++	.long	0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85
++	.long	0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85
++	.long	0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3
++	.long	0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3
++	.long	0xd192e819,0xd6990624,0xf40e3585,0x106aa070
++	.long	0xd192e819,0xd6990624,0xf40e3585,0x106aa070
++	.long	0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5
++	.long	0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5
++	.long	0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3
++	.long	0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3
++	.long	0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208
++	.long	0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208
++	.long	0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2
++	.long	0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2
++
++	.long	0x00010203,0x04050607,0x08090a0b,0x0c0d0e0f
++	.long	0x00010203,0x04050607,0x08090a0b,0x0c0d0e0f
++	.long	0x03020100,0x0b0a0908,0xffffffff,0xffffffff
++	.long	0x03020100,0x0b0a0908,0xffffffff,0xffffffff
++	.long	0xffffffff,0xffffffff,0x03020100,0x0b0a0908
++	.long	0xffffffff,0xffffffff,0x03020100,0x0b0a0908
++	.asciz	"SHA256 block transform for Loongarch64, CRYPTOGAMS by <appro\@openssl.org>"
++___
++} else {
++$code.=<<___;
++.align	6
++.type	$TABLE,\@object
++$TABLE:
++	.quad	0x428a2f98d728ae22,0x7137449123ef65cd
++	.quad	0x428a2f98d728ae22,0x7137449123ef65cd
++	.quad	0xb5c0fbcfec4d3b2f,0xe9b5dba58189dbbc
++	.quad	0xb5c0fbcfec4d3b2f,0xe9b5dba58189dbbc
++	.quad	0x3956c25bf348b538,0x59f111f1b605d019
++	.quad	0x3956c25bf348b538,0x59f111f1b605d019
++	.quad	0x923f82a4af194f9b,0xab1c5ed5da6d8118
++	.quad	0x923f82a4af194f9b,0xab1c5ed5da6d8118
++	.quad	0xd807aa98a3030242,0x12835b0145706fbe
++	.quad	0xd807aa98a3030242,0x12835b0145706fbe
++	.quad	0x243185be4ee4b28c,0x550c7dc3d5ffb4e2
++	.quad	0x243185be4ee4b28c,0x550c7dc3d5ffb4e2
++	.quad	0x72be5d74f27b896f,0x80deb1fe3b1696b1
++	.quad	0x72be5d74f27b896f,0x80deb1fe3b1696b1
++	.quad	0x9bdc06a725c71235,0xc19bf174cf692694
++	.quad	0x9bdc06a725c71235,0xc19bf174cf692694
++	.quad	0xe49b69c19ef14ad2,0xefbe4786384f25e3
++	.quad	0xe49b69c19ef14ad2,0xefbe4786384f25e3
++	.quad	0x0fc19dc68b8cd5b5,0x240ca1cc77ac9c65
++	.quad	0x0fc19dc68b8cd5b5,0x240ca1cc77ac9c65
++	.quad	0x2de92c6f592b0275,0x4a7484aa6ea6e483
++	.quad	0x2de92c6f592b0275,0x4a7484aa6ea6e483
++	.quad	0x5cb0a9dcbd41fbd4,0x76f988da831153b5
++	.quad	0x5cb0a9dcbd41fbd4,0x76f988da831153b5
++	.quad	0x983e5152ee66dfab,0xa831c66d2db43210
++	.quad	0x983e5152ee66dfab,0xa831c66d2db43210
++	.quad	0xb00327c898fb213f,0xbf597fc7beef0ee4
++	.quad	0xb00327c898fb213f,0xbf597fc7beef0ee4
++	.quad	0xc6e00bf33da88fc2,0xd5a79147930aa725
++	.quad	0xc6e00bf33da88fc2,0xd5a79147930aa725
++	.quad	0x06ca6351e003826f,0x142929670a0e6e70
++	.quad	0x06ca6351e003826f,0x142929670a0e6e70
++	.quad	0x27b70a8546d22ffc,0x2e1b21385c26c926
++	.quad	0x27b70a8546d22ffc,0x2e1b21385c26c926
++	.quad	0x4d2c6dfc5ac42aed,0x53380d139d95b3df
++	.quad	0x4d2c6dfc5ac42aed,0x53380d139d95b3df
++	.quad	0x650a73548baf63de,0x766a0abb3c77b2a8
++	.quad	0x650a73548baf63de,0x766a0abb3c77b2a8
++	.quad	0x81c2c92e47edaee6,0x92722c851482353b
++	.quad	0x81c2c92e47edaee6,0x92722c851482353b
++	.quad	0xa2bfe8a14cf10364,0xa81a664bbc423001
++	.quad	0xa2bfe8a14cf10364,0xa81a664bbc423001
++	.quad	0xc24b8b70d0f89791,0xc76c51a30654be30
++	.quad	0xc24b8b70d0f89791,0xc76c51a30654be30
++	.quad	0xd192e819d6ef5218,0xd69906245565a910
++	.quad	0xd192e819d6ef5218,0xd69906245565a910
++	.quad	0xf40e35855771202a,0x106aa07032bbd1b8
++	.quad	0xf40e35855771202a,0x106aa07032bbd1b8
++	.quad	0x19a4c116b8d2d0c8,0x1e376c085141ab53
++	.quad	0x19a4c116b8d2d0c8,0x1e376c085141ab53
++	.quad	0x2748774cdf8eeb99,0x34b0bcb5e19b48a8
++	.quad	0x2748774cdf8eeb99,0x34b0bcb5e19b48a8
++	.quad	0x391c0cb3c5c95a63,0x4ed8aa4ae3418acb
++	.quad	0x391c0cb3c5c95a63,0x4ed8aa4ae3418acb
++	.quad	0x5b9cca4f7763e373,0x682e6ff3d6b2b8a3
++	.quad	0x5b9cca4f7763e373,0x682e6ff3d6b2b8a3
++	.quad	0x748f82ee5defb2fc,0x78a5636f43172f60
++	.quad	0x748f82ee5defb2fc,0x78a5636f43172f60
++	.quad	0x84c87814a1f0ab72,0x8cc702081a6439ec
++	.quad	0x84c87814a1f0ab72,0x8cc702081a6439ec
++	.quad	0x90befffa23631e28,0xa4506cebde82bde9
++	.quad	0x90befffa23631e28,0xa4506cebde82bde9
++	.quad	0xbef9a3f7b2c67915,0xc67178f2e372532b
++	.quad	0xbef9a3f7b2c67915,0xc67178f2e372532b
++	.quad	0xca273eceea26619c,0xd186b8c721c0c207
++	.quad	0xca273eceea26619c,0xd186b8c721c0c207
++	.quad	0xeada7dd6cde0eb1e,0xf57d4f7fee6ed178
++	.quad	0xeada7dd6cde0eb1e,0xf57d4f7fee6ed178
++	.quad	0x06f067aa72176fba,0x0a637dc5a2c898a6
++	.quad	0x06f067aa72176fba,0x0a637dc5a2c898a6
++	.quad	0x113f9804bef90dae,0x1b710b35131c471b
++	.quad	0x113f9804bef90dae,0x1b710b35131c471b
++	.quad	0x28db77f523047d84,0x32caab7b40c72493
++	.quad	0x28db77f523047d84,0x32caab7b40c72493
++	.quad	0x3c9ebe0a15c9bebc,0x431d67c49c100d4c
++	.quad	0x3c9ebe0a15c9bebc,0x431d67c49c100d4c
++	.quad	0x4cc5d4becb3e42b6,0x597f299cfc657e2a
++	.quad	0x4cc5d4becb3e42b6,0x597f299cfc657e2a
++	.quad	0x5fcb6fab3ad6faec,0x6c44198c4a475817
++	.quad	0x5fcb6fab3ad6faec,0x6c44198c4a475817
++
++	.quad	0x0001020304050607,0x08090a0b0c0d0e0f
++	.quad	0x0001020304050607,0x08090a0b0c0d0e0f
++	.asciz	"SHA512 block transform for Loongarch64, CRYPTOGAMS by <appro\@openssl.org>"
++___
++}
++
++{{{
++
++my $ba4=$BT1;
++my ($a,$b,$c,$d,$e,$f,$g,$h);
++
++sub AUTOLOAD()		# thunk [simplified] 32-bit style perlasm
++{ my $opcode = $AUTOLOAD; $opcode =~ s/.*:://;$opcode =~ s/_/\./;
++  my $arg = pop;
++    $arg = "$arg" if ($arg*1 eq $arg);
++    $code .= "\t$opcode\t".join(',',$arg,reverse @_)."\n";
++}
++
++sub body_00_15 () {
++	(
++	'($a,$b,$c,$d,$e,$f,$g,$h)=@ROT;'.
++
++	'&$ROTR($Sigma1[2]-$Sigma1[1],$ba0,$ba0)',
++	'&move($ba1,$a)',
++	'&move($f,$ba4)',
++
++	'&$ROTR	($Sigma0[2]-$Sigma0[1],$ba1,$ba1)',
++	'&xor	($e,$ba0,$ba0)',
++	'&xor	($g,$ba4,$ba4)',		# f^g
++
++	'&$ROTR	($Sigma1[1]-$Sigma1[0],$ba0,$ba0)',
++	'&xor	($a,$ba1,$ba1)',
++	'&and	($e,$ba4,$ba4)',		# (f^g)&e
++
++	'&xor	($e,$ba0,$ba0)',
++	'&$LD	($SZ*($i&15),$sp,$t0)',
++	'&$ADD	($t0,$h,$h)',			# h+=X[i]+K[i]
++	'&move	($a,$ba2)',
++
++	'&xor	($g,$ba4,$ba4)',		# Ch(e,f,g)=((f^g)&e)^g
++	'&$ROTR	($Sigma0[1]-$Sigma0[0],$ba1,$ba1)',
++	'&xor	($b,$ba2,$ba2)',		# a^b, b^c in next round
++
++	'&$ADD	($ba4,$h,$h)',			# h+=Ch(e,f,g)
++	'&$ROTR	($Sigma1[0],$ba0,$ba0)',	# Sigma1(e)
++	'&and	($ba2,$ba3,$ba3)',		# (b^c)&(a^b)
++
++	'&xor	($a,$ba1,$ba1)',
++	'&$ADD	($ba0,$h,$h)',			# h+=Sigma1(e)
++	'&xor	($b,$ba3,$ba3)',		# Maj(a,b,c)=Ch(a^b,c,b)
++
++	'&$ROTR	($Sigma0[0],$ba1,$ba1)',	# Sigma0(a)
++	'&$ADD	($h,$d,$d)',			# d+=h
++	'&$ADD	($ba3,$h,$h)',			# h+=Maj(a,b,c)
++
++	'&move	($d,$ba0)',
++	'&$ADD	($h,$ba1,$ba1);'.		# h+=Sigma0(a)
++	'($ba2,$ba3) = ($ba3,$ba2); unshift(@ROT,pop(@ROT)); $i++;'
++	);
++}
++
++
++
++######################################################################
++# LSX code path
++#
++if ($SZ==4) {	# SHA256 only
++my @X = map("\$vr$_",(0..3));
++my ($vt0,$vt1,$vt2,$vt3,$vt4,$vt5) = map("\$vr$_",(4..9));
++
++$code.=<<___;
++.align	6
++${func}_lsx:
++.Llsx_shortcut:
++	move		$t5,$sp				# copy $sp
++	st.d		$s4,$sp,-8
++	st.d		$fp,$sp,-16
++	st.d		$s0,$sp,-24
++	st.d		$s1,$sp,-32
++	st.d		$s2,$sp,-40
++	st.d		$s3,$sp,-48
++	addi.d		$sp,$sp,-64
++
++	slli.d		$a2,$a2,4			# num*16
++	addi.d		$sp,$sp,-`$FRAMESIZE`
++	slli.d		$a2,$a2,`1*($SZ==4?2:3)`
++	add.d		$a2,$a2,$inp			# inp+num*16*$SZ
++	bstrins.d	$sp,$zero,5,0			# align stack frame
++	st.d		$ctx,$sp,`16*$SZ+0*8`		# save ctx, 1st arg
++	st.d		$inp,$sp,`16*$SZ+1*8`		# save inp, 2nd arh
++	st.d		$a2,$sp,`16*$SZ+2*8`		# save end pointer, "3rd" arg
++	st.d		$t5,$sp,`16*$SZ+3*8`		# save copy of $sp
++___
++$code.=<<___;
++.Lprologue_lsx:
++
++	$LD	$A,$ctx,`$SZ*0`
++	$LD	$B,$ctx,`$SZ*1`
++	$LD	$C,$ctx,`$SZ*2`
++	$LD	$D,$ctx,`$SZ*3`
++	$LD	$E,$ctx,`$SZ*4`
++	$LD	$F,$ctx,`$SZ*5`
++	$LD	$G,$ctx,`$SZ*6`
++	$LD	$H,$ctx,`$SZ*7`
++___
++
++$code.=<<___;
++	b	.Lloop_lsx
++.align	4
++.Lloop_lsx:
++	la.local	$t0,$TABLE
++	vld		$vt3,$t0,`$SZ*2*$rounds`
++	vld		@X[0],$inp,0
++	vld		@X[1],$inp,0x10
++	vld		@X[2],$inp,0x20
++	vshuf.b		@X[0],$vt3,@X[0],$vt3
++	vld		@X[3],$inp,0x30
++	la.local	$Tbl,$TABLE
++	vshuf.b		@X[1],$vt3,@X[1],$vt3
++	vld		$vt0,$Tbl,0x00
++	vld		$vt1,$Tbl,0x20
++	vshuf.b		@X[2],$vt3,@X[2],$vt3
++	vadd.w		$vt0,$vt0,@X[0]
++	vld             $vt2,$Tbl,0x40
++	vshuf.b         @X[3],$vt3,@X[3],$vt3
++	vld             $vt3,$Tbl,0x60
++	vadd.w		$vt1,$vt1,@X[1]
++	vadd.w          $vt2,$vt2,@X[2]
++	vadd.w		$vt3,$vt3,@X[3]
++	vst		$vt0,$sp,0
++	move		$ba1,$A
++	vst		$vt1,$sp,0x10
++	move		$ba3,$B
++	vst		$vt2,$sp,0x20
++	xor		$ba3,$ba3,$C			# magic
++	vst		$vt3,$sp,0x30
++	move		$ba0,$E
++	b		.Llsx_00_47
++
++.align	4
++.Llsx_00_47:
++	addi.d		$Tbl,$Tbl,`16*2*$SZ`
++___
++
++
++sub LSX_256_00_47 () {
++my $j = shift;
++my $body = shift;
++my @X = @_;
++my @insns = (&$body,&$body,&$body,&$body);	# 104 instructions
++
++	  eval(shift(@insns));		#@
++	&vori_b(0,@X[1],$vt0);
++	  eval(shift(@insns));
++	  eval(shift(@insns));
++	&vori_b(0,@X[3],$vt3);
++	  eval(shift(@insns));	#@
++	  eval(shift(@insns));
++	  eval(shift(@insns));
++	  eval(shift(@insns));	#@
++	  eval(shift(@insns));
++	&vbsrl_v($SZ,@X[0],$vr16);	# X[1..4]
++	&vbsll_v(16-$SZ,$vt0,$vr17);
++	&vor_v($vr16,$vr17,$vt0);
++	  eval(shift(@insns));
++	  eval(shift(@insns));
++	&vbsrl_v($SZ,@X[2],$vr16);	# X[9..12]
++	&vbsll_v(16-$SZ,$vt3,$vr17);
++	&vor_v($vr16,$vr17,$vt3);
++	  eval(shift(@insns));
++	  eval(shift(@insns));
++	  eval(shift(@insns));
++	  eval(shift(@insns));	#@
++	&vori_b(0,$vt0,$vt1);
++	  eval(shift(@insns));
++	  eval(shift(@insns));
++	&vori_b(0,$vt0,$vt2);
++	  eval(shift(@insns));	#@
++	  eval(shift(@insns));
++	&vsrli_w($sigma0[2],$vt0,$vt0);
++	  eval(shift(@insns));
++	  eval(shift(@insns));
++	  eval(shift(@insns));
++	&vadd_w($vt3,@X[0],@X[0]);		# X[0..3] += X[9..12]
++	  eval(shift(@insns));	#@
++	  eval(shift(@insns));
++	&vsrli_w($sigma0[0],$vt2,$vt2);
++	  eval(shift(@insns));
++	  eval(shift(@insns));
++	&vshuf4i_w(0b11111010,@X[3],$vt3);	# X[4..15]
++	  eval(shift(@insns));
++	  eval(shift(@insns));	#@
++	&vslli_w(8*$SZ-$sigma0[1],$vt1,$vt1);
++	  eval(shift(@insns));
++	  eval(shift(@insns));
++	&vxor_v($vt2,$vt0,$vt0);
++	  eval(shift(@insns));	#@
++	  eval(shift(@insns));
++	  eval(shift(@insns));
++	  eval(shift(@insns));	#@
++	&vsrli_w($sigma0[1]-$sigma0[0],$vt2,$vt2);
++	  eval(shift(@insns));
++	&vxor_v($vt1,$vt0,$vt0);
++	  eval(shift(@insns));
++	  eval(shift(@insns));
++	&vslli_w($sigma0[1]-$sigma0[0],$vt1,$vt1);
++	  eval(shift(@insns));
++	  eval(shift(@insns));
++	&vxor_v($vt2,$vt0,$vt0);
++	  eval(shift(@insns));
++	  eval(shift(@insns));	#@
++	&vori_b(0,$vt3,$vt2);
++	  eval(shift(@insns));
++	  eval(shift(@insns));
++	&vxor_v($vt1,$vt0,$vt0);		# sigma0(X[1..4])
++	  eval(shift(@insns));	#@
++	  eval(shift(@insns));
++	  eval(shift(@insns));
++	&vsrli_w($sigma1[2],$vt3,$vt3);
++	  eval(shift(@insns));
++	  eval(shift(@insns));
++	&vadd_w($vt0,@X[0],@X[0]);		# X[0..3] += sigma0(X[1..4])
++	  eval(shift(@insns));	#@
++	  eval(shift(@insns));
++	&vsrli_d($sigma1[0],$vt2,$vt2);
++	  eval(shift(@insns));
++	  eval(shift(@insns));
++	  eval(shift(@insns));
++	&vxor_v($vt2,$vt3,$vt3);
++	  eval(shift(@insns));	#@
++	  eval(shift(@insns));
++	  eval(shift(@insns));
++	  eval(shift(@insns));	#@
++	&vsrli_d($sigma1[1]-$sigma1[0],$vt2,$vt2);
++	  eval(shift(@insns));
++	  eval(shift(@insns));
++	 &vxor_v($vt2,$vt3,$vt3);
++	  eval(shift(@insns));	#@
++	  eval(shift(@insns));
++	  eval(shift(@insns));
++	 &vshuf4i_w(0b10000000,$vt3,$vt3);
++	  eval(shift(@insns));
++	  eval(shift(@insns));
++	  eval(shift(@insns));
++	 &vbsrl_v(8,$vt3,$vt3);
++	  eval(shift(@insns));
++	  eval(shift(@insns));	#@
++	  eval(shift(@insns));
++	  eval(shift(@insns));
++	  eval(shift(@insns));	#@
++	&vadd_w($vt3,@X[0],@X[0]);		# X[0..1] += sigma1(X[14..15])
++	  eval(shift(@insns));
++	  eval(shift(@insns));
++	  eval(shift(@insns));
++	&vshuf4i_w(0b01010000,@X[0],$vt3);
++	  eval(shift(@insns));
++	  eval(shift(@insns));	#@
++	  eval(shift(@insns));
++	&vori_b(0,$vt3,$vt2);
++	  eval(shift(@insns));
++	  eval(shift(@insns));
++	&vsrli_w($sigma1[2],$vt3,$vt3);
++	  eval(shift(@insns));
++	  eval(shift(@insns));	#@
++	&vsrli_d($sigma1[0],$vt2,$vt2);
++	  eval(shift(@insns));
++	  eval(shift(@insns));
++	&vxor_v($vt2,$vt3,$vt3);
++	  eval(shift(@insns));	#@
++	  eval(shift(@insns));
++	  eval(shift(@insns));
++	  eval(shift(@insns));	#@
++	  eval(shift(@insns));
++	&vsrli_d($sigma1[1]-$sigma1[0],$vt2,$vt2);
++	  eval(shift(@insns));
++	  eval(shift(@insns));
++	  eval(shift(@insns));
++	&vxor_v($vt2,$vt3,$vt3);
++	  eval(shift(@insns));
++	  eval(shift(@insns));
++	  eval(shift(@insns));	#@
++	 &vshuf4i_w(0b00001000,$vt3,$vt3);
++	  eval(shift(@insns));
++	  eval(shift(@insns));
++	 &vld(16*2*$j,$Tbl,$vt2);
++	  eval(shift(@insns));	#@
++	  eval(shift(@insns));
++	&vbsll_v(8,$vt3,$vt3);
++	  eval(shift(@insns));
++	  eval(shift(@insns));
++	  eval(shift(@insns));
++	&vadd_w($vt3,@X[0],@X[0]);
++	  eval(shift(@insns));	#@
++	  eval(shift(@insns));
++	  eval(shift(@insns));
++	&vadd_w(@X[0],$vt2,$vt2);
++	  foreach (@insns) { eval; }		# remaining instructions
++	&vst(16*$j,$sp,$vt2);
++}
++
++    for ($i=0,$j=0; $j<4; $j++) {
++	&LSX_256_00_47($j,\&body_00_15,@X);
++	push(@X,shift(@X));			# rotate(@X)
++    }
++	&ld_b($SZ-1+16*2*$SZ,$Tbl,$t0);
++	&bne(".Llsx_00_47",$t0,$zero);
++
++    for ($i=0; $i<16; ) {
++	foreach(body_00_15()) { eval; }
++    }
++$code.=<<___;
++	ld.d	$ctx,$sp,`16*$SZ+0*8`
++	move	$A,$ba1
++
++	$LD	$t0,$ctx,$SZ*0
++	$ADD	$A,$A,$t0
++	addi.d	$inp,$inp,16*$SZ
++	$LD	$t0,$ctx,$SZ*1
++	$ADD	$B,$B,$t0
++	$LD	$t0,$ctx,$SZ*2
++	$ADD	$C,$C,$t0
++	$LD	$t0,$ctx,$SZ*3
++	$ADD	$D,$D,$t0
++	$LD	$t0,$ctx,$SZ*4
++	$ADD	$E,$E,$t0
++	$LD	$t0,$ctx,$SZ*5
++	$ADD	$F,$F,$t0
++	$LD	$t0,$ctx,$SZ*6
++	$ADD	$G,$G,$t0
++	$LD	$t0,$ctx,$SZ*7
++	$ADD	$H,$H,$t0
++
++	ld.d	$t0,$sp,`16*$SZ+2*8`
++
++	$ST	$A,$ctx,$SZ*0
++	$ST	$B,$ctx,$SZ*1
++	$ST	$C,$ctx,$SZ*2
++	$ST	$D,$ctx,$SZ*3
++	$ST	$E,$ctx,$SZ*4
++	$ST	$F,$ctx,$SZ*5
++	$ST	$G,$ctx,$SZ*6
++	$ST	$H,$ctx,$SZ*7
++	bltu	$inp,$t0,.Lloop_lsx
++
++	ld.d	$a1,$sp,`16*$SZ+3*8`
++___
++$code.=<<___;
++	ld.d	$s3,$a1,-48
++	ld.d	$s2,$a1,-40
++	ld.d	$s1,$a1,-32
++	ld.d	$s0,$a1,-24
++	ld.d	$fp,$a1,-16
++	ld.d	$s4,$a1,-8
++	move	$sp,$a1
++.Lepilogue_lsx:
++	jr	$ra
++.size	${func}_lsx,.-${func}_lsx
++___
++} else {
++$code.=<<___;
++.align	6
++${func}_lsx:
++.Llsx_shortcut:
++	move		$t5,$sp			# copy $sp
++	st.d		$s4,$sp,-8
++	st.d		$fp,$sp,-16
++	st.d		$s0,$sp,-24
++	st.d		$s1,$sp,-32
++	st.d		$s2,$sp,-40
++	st.d		$s3,$sp,-48
++	addi.d		$sp,$sp,-64
++
++	slli.d		$a2,$a2,4		# num*16
++	addi.d		$sp,$sp,-`$FRAMESIZE`
++	slli.d		$a2,$a2,`1*($SZ==4?2:3)`
++	add.d		$a2,$a2,$inp		# inp+num*16*$SZ
++	bstrins.d	$sp,$zero,5,0		# align stack frame
++	st.d		$ctx,$sp,`16*$SZ+0*8`	# save ctx, 1st arg
++	st.d		$inp,$sp,`16*$SZ+1*8`	# save inp, 2nd arh
++	st.d		$a2,$sp,`16*$SZ+2*8`	# save end pointer, "3rd" arg
++	st.d		$t5,$sp,`16*$SZ+3*8`	# save copy of %rsp
++___
++$code.=<<___;
++.Lprologue_lsx:
++
++	$LD	$A,$ctx,`$SZ*0`
++	$LD	$B,$ctx,`$SZ*1`
++	$LD	$C,$ctx,`$SZ*2`
++	$LD	$D,$ctx,`$SZ*3`
++	$LD	$E,$ctx,`$SZ*4`
++	$LD	$F,$ctx,`$SZ*5`
++	$LD	$G,$ctx,`$SZ*6`
++	$LD	$H,$ctx,`$SZ*7`
++	b	.Lloop_lsx
++___
++{
++# SHA512
++    my @X = map("\$vr$_",(0..7));
++    my ($vt0,$vt1,$vt2,$vt3) = map("\$vr$_",(8..11));
++
++$code.=<<___;
++.align	4
++.Lloop_lsx:
++	la.local	$t0,$TABLE
++	vld		$vt3,$t0,`$SZ*2*$rounds`
++	vld		@X[0],$inp,0
++	addi.d		$Tbl,$t0,0x80			# size optimization
++	vld		@X[1],$inp,0x10
++	vld		@X[2],$inp,0x20
++	vshuf.b		@X[0],$vt3,@X[0],$vt3
++	vld		@X[3],$inp,0x30
++	vshuf.b		@X[1],$vt3,@X[1],$vt3
++	vld		@X[4],$inp,0x40
++	vshuf.b		@X[2],$vt3,@X[2],$vt3
++	vld		@X[5],$inp,0x50
++	vshuf.b		@X[3],$vt3,@X[3],$vt3
++	vld		@X[6],$inp,0x60
++	vshuf.b		@X[4],$vt3,@X[4],$vt3
++	vld		@X[7],$inp,0x70
++	vshuf.b		@X[5],$vt3,@X[5],$vt3
++	vld		$vr16,$Tbl,-0x80
++	vadd.d		$vt0,@X[0],$vr16
++	vshuf.b		@X[6],$vt3,@X[6],$vt3
++	vld             $vr16,$Tbl,-0x60
++	vadd.d		$vt1,@X[1],$vr16
++	vshuf.b		@X[7],$vt3,@X[7],$vt3
++	vld		$vr16,$Tbl,-0x40
++	vadd.d		$vt2,@X[2],$vr16
++	vld		$vr16,$Tbl,-0x20
++	vadd.d		$vt3,@X[3],$vr16
++	vst		$vt0,$sp,0x0
++	vld		$vr16,$Tbl,0x0
++	vadd.d		$vt0,@X[4],$vr16
++	vst		$vt1,$sp,0x10
++	vld		$vr16,$Tbl,0x20
++	vadd.d		$vt1,@X[5],$vr16
++	vst		$vt2,$sp,0x20
++	vld		$vr16,$Tbl,0x40
++	vadd.d		$vt2,@X[6],$vr16
++	vst		$vt3,$sp,0x30
++	vld		$vr16,$Tbl,0x60
++	vadd.d		$vt3,@X[7],$vr16
++	vst		$vt0,$sp,0x40
++	move		$ba1,$A
++	vst		$vt1,$sp,0x50
++	move		$ba3,$B
++	vst		$vt2,$sp,0x60
++	xor		$ba3,$ba3,$C			# magic
++	vst		$vt3,$sp,0x70
++	move		$ba0,$E
++	b		.Llsx_00_47
++
++.align	4
++.Llsx_00_47:
++	addi.d		$Tbl,$Tbl,`16*2*$SZ`
++___
++sub LSX_512_00_47 () {
++my $j = shift;
++my $body = shift;
++my @X = @_;
++my @insns = (&$body,&$body);			# 52 instructions
++
++	&vbsrl_v($SZ,@X[0],$vr16);	# X[1..2]
++	&vbsll_v(16-$SZ,@X[1],$vr17);
++	&vor_v($vr16,$vr17,$vt0);
++	  eval(shift(@insns));
++	  eval(shift(@insns));
++	&vbsrl_v($SZ,@X[4],$vr16);	# X[9..10]
++	&vbsll_v(16-$SZ,@X[5],$vr17);
++	&vor_v($vr16,$vr17,$vt3);
++	  eval(shift(@insns));
++	  eval(shift(@insns));
++	&vrotri_d($sigma0[1],$vt0,$vt1);
++	  eval(shift(@insns));
++	  eval(shift(@insns));
++	&vsrli_d($sigma0[2],$vt0,$vt0);
++	  eval(shift(@insns));
++	  eval(shift(@insns));
++	&vadd_d($vt3,@X[0],@X[0]);	# X[0..1] += X[9..10]
++	  eval(shift(@insns));
++	  eval(shift(@insns));
++	  eval(shift(@insns));
++	  eval(shift(@insns));
++	&vrotri_d(8*$SZ-$sigma0[1]+$sigma0[0],$vt1,$vt2);
++	  eval(shift(@insns));
++	  eval(shift(@insns));
++	&vxor_v($vt1,$vt0,$vt0);
++	  eval(shift(@insns));
++	  eval(shift(@insns));
++	  eval(shift(@insns));
++	  eval(shift(@insns));
++	&vrotri_d($sigma1[1],@X[7],$vt3);
++	  eval(shift(@insns));
++	  eval(shift(@insns));
++	&vxor_v($vt2,$vt0,$vt0);	# sigma0(X[1..2])
++	  eval(shift(@insns));
++	  eval(shift(@insns));
++	&vsrli_d($sigma1[2],@X[7],$vt2);
++	  eval(shift(@insns));
++	  eval(shift(@insns));
++	&vadd_d($vt0,@X[0],@X[0]);	# X[0..1] += sigma0(X[1..2])
++	  eval(shift(@insns));
++	  eval(shift(@insns));
++	&vrotri_d(8*$SZ-$sigma1[1]+$sigma1[0],$vt3,$vt1);
++	  eval(shift(@insns));
++	  eval(shift(@insns));
++	&vxor_v($vt2,$vt3,$vt3);
++	  eval(shift(@insns));
++	  eval(shift(@insns));
++	  eval(shift(@insns));
++	  eval(shift(@insns));
++	&vxor_v($vt1,$vt3,$vt3);	# sigma1(X[14..15])
++	  eval(shift(@insns));
++	  eval(shift(@insns));
++	  eval(shift(@insns));
++	  eval(shift(@insns));
++	&vadd_d($vt3,@X[0],@X[0]);	# X[0..1] += sigma1(X[14..15])
++	  eval(shift(@insns));
++	  eval(shift(@insns));
++	  eval(shift(@insns));
++	  eval(shift(@insns));
++	&vld(16*2*$j-0x80,$Tbl,$vr16);
++	&vadd_d($vr16,@X[0],$vt2);
++	  foreach (@insns) { eval; }		# remaining instructions
++	&vst(16*$j,$sp,$vt2);
++}
++
++    for ($i=0,$j=0; $j<8; $j++) {
++	&LSX_512_00_47($j,\&body_00_15,@X);
++	push(@X,shift(@X));			# rotate(@X)
++    }
++	&ld_b($SZ-1+16*2*$SZ-0x80,$Tbl,$t0);
++	&bne(".Llsx_00_47",$t0,$zero);
++
++    for ($i=0; $i<16; ) {
++	foreach(body_00_15()) { eval; }
++    }
++}
++$code.=<<___;
++	ld.d	$ctx,$sp,`16*$SZ+0*8`
++	move	$A,$ba1
++
++	$LD	$t0,$ctx,$SZ*0
++	$ADD	$A,$A,$t0
++	addi.d	$inp,$inp,16*$SZ
++	$LD	$t0,$ctx,$SZ*1
++	$ADD	$B,$B,$t0
++	$LD	$t0,$ctx,$SZ*2
++	$ADD	$C,$C,$t0
++	$LD	$t0,$ctx,$SZ*3
++	$ADD	$D,$D,$t0
++	$LD	$t0,$ctx,$SZ*4
++	$ADD	$E,$E,$t0
++	$LD	$t0,$ctx,$SZ*5
++	$ADD	$F,$F,$t0
++	$LD	$t0,$ctx,$SZ*6
++	$ADD	$G,$G,$t0
++	$LD	$t0,$ctx,$SZ*7
++	$ADD	$H,$H,$t0
++
++	ld.d	$t0,$sp,`16*$SZ+2*8`
++
++	$ST	$A,$ctx,$SZ*0
++	$ST	$B,$ctx,$SZ*1
++	$ST	$C,$ctx,$SZ*2
++	$ST	$D,$ctx,$SZ*3
++	$ST	$E,$ctx,$SZ*4
++	$ST	$F,$ctx,$SZ*5
++	$ST	$G,$ctx,$SZ*6
++	$ST	$H,$ctx,$SZ*7
++	bltu	$inp,$t0,.Lloop_lsx
++
++	ld.d	$a1,$sp,`16*$SZ+3*8`
++
++___
++$code.=<<___;
++	ld.d	$s3,$a1,-48
++	ld.d	$s2,$a1,-40
++	ld.d	$s1,$a1,-32
++	ld.d	$s0,$a1,-24
++	ld.d	$fp,$a1,-16
++	ld.d	$s4,$a1,-8
++	move	$sp,$a1
++.Lepilogue_lsx:
++	jr	$ra
++.size	${func}_lsx,.-${func}_lsx
++___
++}
++
++
++
++{{
++######################################################################
++# LASX code path
++#
++my $ba5=$a1;	# zap $inp
++my $PUSH8=8*2*$SZ;
++use integer;
++
++
++
++
++sub Xupdate_256_LASX () {
++	(
++	'&xvbsrl_v($SZ,@X[0],$xr16)',
++	'&xvbsll_v(16-$SZ,@X[1],$xr17)',
++	'&xvor_v($xr16,$xr17,$bt0)',
++	'&xvbsrl_v($SZ,@X[2],$xr16)',
++	'&xvbsll_v(16-$SZ,@X[3],$xr17)',
++	'&xvor_v($xr16,$xr17,$bt3)',
++	'&xvsrli_w($sigma0[0],$bt0,$bt2);',
++	'&xvadd_w($bt3,@X[0],@X[0])',				# X[0..3] += X[9..12]
++	'&xvsrli_w($sigma0[2],$bt0,$bt3)',
++	'&xvslli_w(8*$SZ-$sigma0[1],$bt0,$bt1);',
++	'&xvxor_v($bt2,$bt3,$bt0)',
++	'&xvshuf4i_w(0b11111010,@X[3],$bt3)',			# X[14..15]
++	'&xvsrli_w($sigma0[1]-$sigma0[0],$bt2,$bt2);',
++	'&xvxor_v($bt1,$bt0,$bt0)',
++	'&xvslli_w($sigma0[1]-$sigma0[0],$bt1,$bt1);',
++	'&xvxor_v($bt2,$bt0,$bt0)',
++	'&xvsrli_w($sigma1[2],$bt3,$bt2);',
++	'&xvxor_v($bt1,$bt0,$bt0)',				# sigma0(X[1..4])
++	'&xvsrli_d($sigma1[0],$bt3,$bt3);',
++	'&xvadd_w($bt0,@X[0],@X[0])',				# X[0..3] += sigma0(X[1..4])
++	'&xvxor_v($bt3,$bt2,$bt2);',
++	'&xvsrli_d($sigma1[1]-$sigma1[0],$bt3,$bt3)',
++	'&xvxor_v($bt3,$bt2,$bt2);',
++	'&xvshuf_b($bt4,$bt2,$bt4,$bt2)',			# sigma1(X[14..15])
++	'&xvadd_w($bt2,@X[0],@X[0])',				# X[0..1] += sigma1(X[14..15])
++	'&xvshuf4i_w(0b01010000,@X[0],$bt3)',			# X[16..17]
++	'&xvsrli_w($sigma1[2],$bt3,$bt2)',
++	'&xvsrli_d($sigma1[0],$bt3,$bt3)',
++	'&xvxor_v($bt3,$bt2,$bt2);',
++	'&xvsrli_d($sigma1[1]-$sigma1[0],$bt3,$bt3)',
++	'&xvxor_v($bt3,$bt2,$bt2);',
++	'&xvshuf_b($bt5,$bt2,$bt5,$bt2)',
++	'&xvadd_w($bt2,@X[0],@X[0])'				# X[2..3] += sigma1(X[16..17])
++	);
++}
++
++
++sub Xupdate_512_LASX () {
++	(
++	'&xvbsrl_v($SZ,@X[0],$xr16)',
++	'&xvbsll_v(16-$SZ,@X[1],$xr17)',
++	'&xvor_v($xr16,$xr17,$bt0)',
++	'&xvbsrl_v($SZ,@X[4],$xr16)',
++	'&xvbsll_v(16-$SZ,@X[5],$xr17)',
++	'&xvor_v($xr16,$xr17,$bt3)',
++	'&xvsrli_d($sigma0[0],$bt0,$bt2)',
++	'&xvadd_d($bt3,@X[0],@X[0]);',				# X[0..1] += X[9..10]
++	'&xvsrli_d($sigma0[2],$bt0,$bt3)',
++	'&xvslli_d(8*$SZ-$sigma0[1],$bt0,$bt1);',
++	'&xvxor_v($bt2,$bt3,$bt0)',
++	'&xvsrli_d($sigma0[1]-$sigma0[0],$bt2,$bt2);',
++	'&xvxor_v($bt1,$bt0,$bt0)',
++	'&xvslli_d($sigma0[1]-$sigma0[0],$bt1,$bt1);',
++	'&xvxor_v($bt2,$bt0,$bt0)',
++	'&xvsrli_d($sigma1[2],@X[7],$bt3);',
++	'&xvxor_v($bt1,$bt0,$bt0)',				# sigma0(X[1..2])
++	'&xvslli_d(8*$SZ-$sigma1[1],@X[7],$bt2);',
++	'&xvadd_d($bt0,@X[0],@X[0])',				# X[0..1] += sigma0(X[1..2])
++	'&xvsrli_d($sigma1[0],@X[7],$bt1);',
++	'&xvxor_v($bt2,$bt3,$bt3)',
++	'&xvslli_d($sigma1[1]-$sigma1[0],$bt2,$bt2);',
++	'&xvxor_v($bt1,$bt3,$bt3)',
++	'&xvsrli_d($sigma1[1]-$sigma1[0],$bt1,$bt1);',
++	'&xvxor_v($bt2,$bt3,$bt3)',
++	'&xvxor_v($bt1,$bt3,$bt3)',				# sigma1(X[14..15])
++	'&xvadd_d($bt3,@X[0],@X[0])',				# X[0..1] += sigma1(X[14..15])
++	);
++}
++
++
++sub bodyx_00_15 () {
++	# at start $ba1 should be zero, $ba3 - $b^$c and $ba4 copy of $f
++	(
++	'($a,$b,$c,$d,$e,$f,$g,$h)=@ROT;'.
++
++	'&$LD((32*($i/(16/$SZ))+$SZ*($i%(16/$SZ)))%$PUSH8+$base,$basep,$t0)',
++	'&$ADD	($t0,$h,$h)',
++	'&and	($e,$ba4,$ba4)',				# f&e
++	'&$ROTR	($Sigma1[2],$e,$ba0)',
++	'&$ROTR	($Sigma1[1],$e,$ba2)',
++	'&$ADD	($ba1,$a,$a)',					# h+=Sigma0(a) from the past
++	'&$ADD	($ba4,$h,$h)',
++	'&andn	($e,$g,$ba4)',					# ~e&g
++	'&xor	($ba2,$ba0,$ba0)',
++	'&$ROTR	($Sigma1[0],$e,$ba1)',
++	'&$ADD	($ba4,$h,$h)',					# h+=Ch(e,f,g)=(e&f)+(~e&g)
++	'&xor	($ba1,$ba0,$ba0)',				# Sigma1(e)
++	'&move	($a,$ba2)',
++	'&$ROTR	($Sigma0[2],$a,$ba4)',
++	'&$ADD	($ba0,$h,$h)',					# h+=Sigma1(e)
++	'&xor	($b,$ba2,$ba2)',				# a^b, b^c in next round
++	'&$ROTR	($Sigma0[1],$a,$ba1)',
++	'&$ROTR	($Sigma0[0],$a,$ba0)',
++	'&$ADD	($h,$d,$d)',					# d+=h
++	'&and	($ba2,$ba3,$ba3)',				# (b^c)&(a^b)
++	'&xor	($ba4,$ba1,$ba1)',
++	'&xor	($b,$ba3,$ba3)',				# Maj(a,b,c)=Ch(a^b,c,b)
++	'&xor	($ba0,$ba1,$ba1)',				# Sigma0(a)
++	'&$ADD	($ba3,$h,$h);'.					# h+=Maj(a,b,c)
++	'&move	($e,$ba4)',					# copy of f in future
++
++	'($ba2,$ba3) = ($ba3,$ba2); unshift(@ROT,pop(@ROT)); $i++;'
++	);
++	# and at the finish one has to $a+=$ba1
++}
++
++$code.=<<___;
++.align	6
++${func}_lasx:
++.Llasx_shortcut:
++	move		$t5,$sp					# copy %rsp
++	st.d		$s4,$sp,-8
++	st.d		$fp,$sp,-16
++	st.d		$s0,$sp,-24
++	st.d		$s1,$sp,-32
++	st.d		$s2,$sp,-40
++	st.d		$s3,$sp,-48
++	addi.d		$sp,$sp,-64
++	addi.d		$sp,$sp,`-(2*$SZ*$rounds+4*8)`
++	slli.d		$a2,$a2,4				# num*16
++	bstrins.d	$sp,$zero,`1*($SZ==4?9:10)`,0		# align stack frame
++	slli.d		$a2,$a2,`1*($SZ==4?2:3)`
++	add.d		$a2,$a2,$inp				# inp+num*16*$SZ
++	addi.d		$sp,$sp,`2*$SZ*($rounds-8)`
++	st.d		$ctx,$sp,`16*$SZ+0*8`			# save ctx, 1st arg
++	st.d		$inp,$sp,`16*$SZ+1*8`			# save inp, 2nd arh
++	st.d		$a2,$sp,`16*$SZ+2*8`			# save end pointer, "3rd" arg
++	st.d		$t5,$sp,`16*$SZ+3*8`			# save copy of %rsp
++___
++$code.=<<___;
++.Lprologue_lasx:
++	xvxor.v		$xr0,$xr0,$xr0
++	xvxor.v		$xr1,$xr0,$xr0
++	xvxor.v		$xr2,$xr0,$xr0
++	xvxor.v		$xr3,$xr0,$xr0
++	xvxor.v		$xr4,$xr0,$xr0
++	xvxor.v		$xr5,$xr0,$xr0
++	xvxor.v		$xr6,$xr0,$xr0
++	xvxor.v		$xr7,$xr0,$xr0
++	xvxor.v		$xr8,$xr0,$xr0
++	xvxor.v		$xr9,$xr0,$xr0
++	xvxor.v		$xr10,$xr0,$xr0
++	xvxor.v		$xr11,$xr0,$xr0
++	xvxor.v		$xr12,$xr0,$xr0
++	xvxor.v		$xr13,$xr0,$xr0
++	xvxor.v		$xr14,$xr0,$xr0
++	xvxor.v		$xr15,$xr0,$xr0
++	xvxor.v		$xr16,$xr0,$xr0
++	xvxor.v		$xr17,$xr0,$xr0
++	addi.d	$inp,$inp,`16*$SZ`				# inp++, size optimization
++	$LD	$A,$ctx,`$SZ*0`
++	move	$s0,$inp					# borrow $BT1
++	$LD	$B,$ctx,`$SZ*1`
++	$LD	$C,$ctx,`$SZ*2`
++	bne	$a2,$inp,1f
++	move	$s0,$sp						# next block or random data
++1:
++	$LD	$D,$ctx,`$SZ*3`
++	$LD	$E,$ctx,`$SZ*4`
++	$LD	$F,$ctx,`$SZ*5`
++	$LD	$G,$ctx,`$SZ*6`
++	$LD	$H,$ctx,`$SZ*7`
++___
++
++if ($SZ==4) {	# SHA256
++    my @X = map("\$xr$_",(0..3));
++    my ($bt0,$bt1,$bt2,$bt3,$bt4,$bt5) = map("\$xr$_",(4..9));
++
++$code.=<<___;
++	la.local	$t0,$TABLE
++	xvld		$bt4,$t0,`$SZ*2*$rounds+32`
++	xvld		$bt5,$t0,`$SZ*2*$rounds+64`
++	b		.Loop_lasx
++.align	4
++.Loop_lasx:
++	la.local	$t0,$TABLE
++	xvld		$bt3,$t0,`$SZ*2*$rounds`
++	vld		$vr0,$inp,`-16*$SZ`
++	vld		$vr1,$inp,`-16*$SZ+16`
++	vld		$vr2,$inp,`-16*$SZ+32`
++	vld		$vr3,$inp,`-16*$SZ+48`
++	vld		$vr16,$s0,0
++	xvpermi.q	@X[0],$xr16,2
++	vld		$vr16,$s0,16
++	xvpermi.q	@X[1],$xr16,2
++	xvshuf.b	@X[0],$bt3,@X[0],$bt3
++	vld             $vr16,$s0,32
++	xvpermi.q	@X[2],$xr16,2
++	xvshuf.b	@X[1],$bt3,@X[1],$bt3
++	vld		$vr16,$s0,48
++	xvpermi.q       @X[3],$xr16,2
++
++	la.local	$Tbl,$TABLE
++	xvshuf.b	@X[2],$bt3,@X[2],$bt3
++	xvld		$xr16,$Tbl,0x00
++	xvadd.w		$bt0,@X[0],$xr16
++	xvshuf.b	@X[3],$bt3,@X[3],$bt3
++	xvld            $xr16,$Tbl,0x20
++	xvadd.w         $bt1,@X[1],$xr16
++	xvld		$xr16,$Tbl,0x40
++	xvadd.w         $bt2,@X[2],$xr16
++	xvld            $xr16,$Tbl,0x60
++	xvadd.w		$bt3,@X[3],$xr16
++	xvst		$bt0,$sp,0
++	xor		$ba1,$ba1,$ba1
++	xvst		$bt1,$sp,0x20
++	addi.d		$sp,$sp,-$PUSH8
++	move		$ba3,$B
++	xvst		$bt2,$sp,0x00
++	xor		$ba3,$ba3,$C				# magic
++	xvst		$bt3,$sp,0x20
++	move		$ba4,$F
++	addi.d		$Tbl,$Tbl,`16*2*$SZ`			# size optimization
++	b		.Llasx_00_47
++
++.align	4
++.Llasx_00_47:
++___
++
++sub LASX_256_00_47 () {
++my $j = shift;
++my $body = shift;
++my @X = @_;
++my @insns = (&$body,&$body,&$body,&$body);	# 100 instructions
++my $base = 2*$PUSH8;
++my $basep = $sp;
++
++	&addi_d	(-$PUSH8,$sp,$sp)	if (($j%2)==0);
++	foreach (Xupdate_256_LASX()) {		# 33 instructions
++	    eval;
++	    eval(shift(@insns));
++	    eval(shift(@insns));
++	    eval(shift(@insns));
++	}
++	&xvld(16*2*$j,$Tbl,$xr16);
++	&xvadd_w($xr16,@X[0],$bt2);
++	foreach (@insns) { eval; }		# remaining instructions
++	&xvst((32*$j)%$PUSH8,$sp,$bt2);
++}
++
++    for ($i=0,$j=0; $j<4; $j++) {
++	&LASX_256_00_47($j,\&bodyx_00_15,@X);
++	push(@X,shift(@X));			# rotate(@X)
++    }
++	&addi_d(16*2*$SZ,$Tbl,$Tbl);
++	&ld_b($SZ-1,$Tbl,$t0);
++	&bne(".Llasx_00_47",$t0,$zero);
++
++    for ($i=0; $i<16; ) {
++	my $base=$i<8?$PUSH8:0;
++	my $basep=$sp;
++	foreach(bodyx_00_15()) { eval; }
++    }
++					} else {	# SHA512
++    my @X = map("\$xr$_",(0..7));
++    my ($bt0,$bt1,$bt2,$bt3) = map("\$xr$_",(8..11));
++
++$code.=<<___;
++	b	.Loop_lasx
++.align	4
++.Loop_lasx:
++	vld		$vr0,$inp,`-16*$SZ`
++	vld		$vr1,$inp,`-16*$SZ+16`
++	vld		$vr2,$inp,`-16*$SZ+32`
++	la.local	$Tbl,$TABLE
++	addi.d		$Tbl,$Tbl,0x80
++	vld		$vr3,$inp,`-16*$SZ+48`
++	vld		$vr4,$inp,`-16*$SZ+64`
++	vld		$vr5,$inp,`-16*$SZ+80`
++	vld		$vr6,$inp,`-16*$SZ+96`
++	vld		$vr7,$inp,`-16*$SZ+112`
++	xvld		$bt2,$Tbl,`$SZ*2*$rounds-0x80`
++	vld		$vr16,$s0,0
++	xvpermi.q	@X[0],$xr16,2
++	vld             $vr16,$s0,16
++	xvpermi.q	@X[1],$xr16,2
++	xvshuf.b	@X[0],$bt2,@X[0],$bt2
++	vld		$vr16,$s0,32
++	xvpermi.q	@X[2],$xr16,2
++	xvshuf.b	@X[1],$bt2,@X[1],$bt2
++	vld		$vr16,$s0,48
++	xvpermi.q	@X[3],$xr16,2
++	xvshuf.b	@X[2],$bt2,@X[2],$bt2
++	vld             $vr16,$s0,64
++	xvpermi.q	@X[4],$xr16,2
++	xvshuf.b	@X[3],$bt2,@X[3],$bt2
++	vld             $vr16,$s0,80
++	xvpermi.q	@X[5],$xr16,2
++	xvshuf.b	@X[4],$bt2,@X[4],$bt2
++	vld		$vr16,$s0,96
++	xvpermi.q	@X[6],$xr16,2
++	xvshuf.b	@X[5],$bt2,@X[5],$bt2
++	vld             $vr16,$s0,112
++	xvpermi.q	@X[7],$xr16,2
++
++	xvld		$xr16,$Tbl,-0x80
++	xvadd.d		$bt0,@X[0],$xr16
++	xvshuf.b	@X[6],$bt2,@X[6],$bt2
++	xvld		$xr16,$Tbl,-0x60
++	xvadd.d		$bt1,@X[1],$xr16
++	xvshuf.b	@X[7],$bt2,@X[7],$bt2
++	xvld            $xr16,$Tbl,-0x40
++	xvadd.d		$bt2,@X[2],$xr16
++	xvld            $xr16,$Tbl,-0x20
++	xvadd.d		$bt3,@X[3],$xr16
++	xvst		$bt0,$sp,0x00
++	xvld		$xr16,$Tbl,0x00
++	xvadd.d		$bt0,@X[4],$xr16
++	xvst		$bt1,$sp,0x20
++	xvld		$xr16,$Tbl,0x20
++	xvadd.d		$bt1,@X[5],$xr16
++	xvst		$bt2,$sp,0x40
++	xvld		$xr16,$Tbl,0x40
++	xvadd.d		$bt2,@X[6],$xr16
++	xvst		$bt3,$sp,0x60
++	addi.d		$sp,$sp,-$PUSH8
++	xvld		$xr16,$Tbl,0x60
++	xvadd.d		$bt3,@X[7],$xr16
++	xvst		$bt0,$sp,0x00
++	xor		$ba1,$ba1,$ba1
++	xvst		$bt1,$sp,0x20
++	move		$ba3,$B
++	xvst		$bt2,$sp,0x40
++	xor		$ba3,$ba3,$C			# magic
++	xvst		$bt3,$sp,0x60
++	move		$ba4,$F
++	addi.d		$Tbl,$Tbl,`16*2*$SZ`
++	b		.Llasx_00_47
++
++.align	4
++.Llasx_00_47:
++___
++
++sub LASX_512_00_47 () {
++my $j = shift;
++my $body = shift;
++my @X = @_;
++my @insns = (&$body,&$body);			# 50 instructions
++my $base = 2*$PUSH8;
++my $basep = $sp;
++
++	&addi_d	(-$PUSH8,$sp,$sp)	if (($j%4)==0);
++	foreach (Xupdate_512_LASX()) {		# 27 instructions
++	    eval;
++	    if ($_ !~ /\;$/) {
++		eval(shift(@insns));
++		eval(shift(@insns));
++		eval(shift(@insns));
++	    }
++	}
++	&xvld(16*2*$j-0x80,$Tbl,$xr16);
++	&xvadd_d($xr16,@X[0],$bt2);
++	foreach (@insns) { eval; }		# remaining instructions
++	&xvst	((32*$j)%$PUSH8,$sp,$bt2);
++}
++
++    for ($i=0,$j=0; $j<8; $j++) {
++	&LASX_512_00_47($j,\&bodyx_00_15,@X);
++	push(@X,shift(@X));			# rotate(@X)
++    }
++	&addi_d(16*2*$SZ,$Tbl,$Tbl);
++	&ld_b($SZ-1-0x80,$Tbl,$t0);
++	&bne(".Llasx_00_47",$t0,$zero);
++
++    for ($i=0; $i<16; ) {
++	my $base=$i<8?$PUSH8:0;
++	my $basep=$sp;
++	foreach(bodyx_00_15()) { eval; }
++    }
++}
++$code.=<<___;
++	ld.d	$ctx,$sp,`2*$SZ*$rounds`	# $_ctx
++	$ADD	$A,$A,$ba1
++	addi.d	$Tbl,$sp,`2*$SZ*($rounds-8)`
++
++	$LD	$t0,$ctx,`$SZ*0`
++	$ADD	$A,$A,$t0
++	$LD	$t0,$ctx,`$SZ*1`
++	$ADD    $B,$B,$t0
++	$LD	$t0,$ctx,`$SZ*2`
++	$ADD    $C,$C,$t0
++	$LD	$t0,$ctx,`$SZ*3`
++	$ADD    $D,$D,$t0
++	$LD	$t0,$ctx,`$SZ*4`
++	$ADD	$E,$E,$t0
++	$LD	$t0,$ctx,`$SZ*5`
++	$ADD	$F,$F,$t0
++	$LD	$t0,$ctx,`$SZ*6`
++	$ADD    $G,$G,$t0
++	$LD	$t0,$ctx,`$SZ*7`
++	$ADD	$H,$H,$t0
++
++	$ST	$A,$ctx,`$SZ*0`
++	$ST	$B,$ctx,`$SZ*1`
++	$ST	$C,$ctx,`$SZ*2`
++	$ST	$D,$ctx,`$SZ*3`
++	$ST	$E,$ctx,`$SZ*4`
++	$ST	$F,$ctx,`$SZ*5`
++	$ST	$G,$ctx,`$SZ*6`
++	$ST	$H,$ctx,`$SZ*7`
++
++	ld.d	$t0,$Tbl,`$PUSH8+2*8`		# $_end
++	beq	$t0,$inp,.Ldone_lasx
++
++	xor	$ba1,$ba1,$ba1
++	move	$ba3,$B
++	xor	$ba3,$ba3,$C			# magic
++	move	$ba4,$F
++	b	.Lower_lasx
++.align	4
++.Lower_lasx:
++___
++    for ($i=0; $i<8; ) {
++	my $base=16;
++	my $basep=$Tbl;
++	foreach(bodyx_00_15()) { eval; }
++    }
++$code.=<<___;
++	addi.d	$Tbl,$Tbl,-$PUSH8			#lea	-$PUSH8($Tbl),$Tbl
++	bge	$Tbl,$sp,.Lower_lasx
++
++	ld.d	$ctx,$sp,`2*$SZ*$rounds`		# $_ctx
++	$ADD	$A,$A,$ba1
++	addi.d	$sp,$sp,`2*$SZ*($rounds-8)`
++
++	$LD   $t0,$ctx,`$SZ*0`
++	$ADD    $A,$A,$t0
++	$LD   $t0,$ctx,`$SZ*1`
++	$ADD	$B,$B,$t0
++	$LD   $t0,$ctx,`$SZ*2`
++	$ADD    $C,$C,$t0
++	$LD   $t0,$ctx,`$SZ*3`
++	$ADD    $D,$D,$t0
++	$LD   $t0,$ctx,`$SZ*4`
++	$ADD    $E,$E,$t0
++	$LD   $t0,$ctx,`$SZ*5`
++	$ADD    $F,$F,$t0
++	addi.d	$inp,$inp,`2*16*$SZ`			# inp+=2
++	$LD   $t0,$ctx,`$SZ*6`
++	$ADD    $G,$G,$t0
++	move	$s0,$inp
++	$LD   $t0,$ctx,`$SZ*7`
++	$ADD    $H,$H,$t0
++	ld.d	$t0,$sp,`16*$SZ+2*8`
++
++	$ST	$A,$ctx,`$SZ*0`
++	bne	$t0,$inp,2f
++	move	$s0,$sp
++2:
++	$ST  $B,$ctx,`$SZ*1`
++	$ST  $C,$ctx,`$SZ*2`
++	$ST  $D,$ctx,`$SZ*3`
++	$ST  $E,$ctx,`$SZ*4`
++	$ST  $F,$ctx,`$SZ*5`
++	$ST  $G,$ctx,`$SZ*6`
++	$ST  $H,$ctx,`$SZ*7`
++
++	bge	$t0,$inp,.Loop_lasx
++	move	$Tbl,$sp
++
++.Ldone_lasx:
++	move	$sp,$Tbl
++	ld.d	$a1,$sp,`16*$SZ+3*8`
++	xvxor.v		$xr0,$xr0,$xr0
++	xvxor.v		$xr1,$xr0,$xr0
++	xvxor.v		$xr2,$xr0,$xr0
++	xvxor.v		$xr3,$xr0,$xr0
++	xvxor.v		$xr4,$xr0,$xr0
++	xvxor.v		$xr5,$xr0,$xr0
++	xvxor.v		$xr6,$xr0,$xr0
++	xvxor.v		$xr7,$xr0,$xr0
++	xvxor.v		$xr8,$xr0,$xr0
++	xvxor.v		$xr9,$xr0,$xr0
++	xvxor.v		$xr10,$xr0,$xr0
++	xvxor.v		$xr11,$xr0,$xr0
++	xvxor.v		$xr12,$xr0,$xr0
++	xvxor.v		$xr13,$xr0,$xr0
++	xvxor.v		$xr14,$xr0,$xr0
++	xvxor.v		$xr15,$xr0,$xr0
++	xvxor.v		$xr16,$xr0,$xr0
++	xvxor.v		$xr17,$xr0,$xr0
++___
++$code.=<<___;
++	ld.d	$s3,$a1,-48
++	ld.d	$s2,$a1,-40
++	ld.d	$s1,$a1,-32
++	ld.d	$s0,$a1,-24
++	ld.d	$fp,$a1,-16
++	ld.d	$s4,$a1,-8
++	move	$sp,$a1
++.Lepilogue_lasx:
++	jr	$ra
++.size	${func}_lasx,.-${func}_lasx
++___
++}}}}}
++
++{{
++if ($output =~ /512/) {
++        @Sigma0=(28,34,39);
++        @Sigma1=(14,18,41);
++        @sigma0=( 7, 1, 8);     # right shift first
++        @sigma1=( 6,19,61);     # right shift first
++} else {
++        @Sigma0=( 2,13,22);
++        @Sigma1=( 6,11,25);
++        @sigma0=( 3, 7,18);     # right shift first
++        @sigma1=(10,17,19);     # right shift first
++}
++
++($A,$B,$C,$D,$E,$F,$G,$H)=map("\$r$_",(1,7,16,17,18,19,20,22));
++@X=map("\$r$_",(8..15,23..30));
++@V=($F,$D,$E,$B,$G,$C,$H,$A);
++
++$ctx=$a0;
++$inp=$a1;
++$len=$a2;
++$Ktbl=$len;
++
++sub BODY_00_15 {
++my ($i,$a,$b,$c,$d,$e,$f,$g,$h)=@_;
++my ($T1,$tmp0,$tmp1,$tmp2)=(@X[4],@X[5],@X[6],@X[7]);
++my $K_Step = ($SZ==4?4:2);
++my $K_Offset = (($i%$K_Step)*$SZ)+($i-($i%$K_Step))*$SZ*2;
++
++$code.=<<___ if ($i<15);
++        ${LD}   @X[1],$inp,`($i+1)*$SZ`
++___
++$code.=<<___    if (!$big_endian && $i<16 && $SZ==4);
++        revb.2h @X[0],@X[0]             # byte swap($i)
++        rotri.w @X[0],@X[0],16
++___
++$code.=<<___    if (!$big_endian && $i<16 && $SZ==8);
++        revb.4h @X[0],@X[0]             # byte swap($i)
++        revh.d  @X[0],@X[0]
++___
++$code.=<<___;
++        xor     $tmp2,$f,$g                     		# $i
++        $ROTR   $tmp0,$e,@Sigma1[0]
++        $ADD    $T1,$X[0],$h
++        $ROTR   $tmp1,$e,@Sigma1[1]
++        and     $tmp2,$tmp2,$e
++        $ROTR   $h,$e,@Sigma1[2]
++        xor     $tmp0,$tmp0,$tmp1
++        $ROTR   $tmp1,$a,@Sigma0[0]
++        xor     $tmp2,$tmp2,$g                  		# Ch(e,f,g)
++        xor     $tmp0,$tmp0,$h                  		# Sigma1(e)
++
++        $ROTR   $h,$a,@Sigma0[1]
++        $ADD    $T1,$T1,$tmp2
++        $LD     $tmp2,$Ktbl,$K_Offset				# K[$i]
++        xor     $h,$h,$tmp1
++        $ROTR   $tmp1,$a,@Sigma0[2]
++        $ADD    $T1,$T1,$tmp0
++        and     $tmp0,$b,$c
++        xor     $h,$h,$tmp1                     		# Sigma0(a)
++        xor     $tmp1,$b,$c
++
++        $ST     @X[0],$sp,`($i%16)*$SZ`				# offload to ring buffer
++        $ADD    $h,$h,$tmp0
++        and     $tmp1,$tmp1,$a
++        $ADD    $T1,$T1,$tmp2					# +=K[$i]
++        $ADD    $h,$h,$tmp1					# +=Maj(a,b,c)
++        $ADD    $d,$d,$T1
++        $ADD    $h,$h,$T1
++___
++$code.=<<___ if ($i>=13);
++        $LD     @X[3],$sp,`(($i+3)%16)*$SZ`			# prefetch from ring buffer
++___
++}
++
++sub BODY_16_XX {
++my $i=@_[0];
++my ($tmp0,$tmp1,$tmp2,$tmp3)=(@X[4],@X[5],@X[6],@X[7]);
++
++$code.=<<___;
++        $SRL    $tmp2,@X[1],@sigma0[0]                  # Xupdate($i)
++        $ROTR   $tmp0,@X[1],@sigma0[1]
++        $ADD    @X[0],@X[0],@X[9]                       # +=X[i+9]
++        xor     $tmp2,$tmp2,$tmp0
++        $ROTR   $tmp0,@X[1],@sigma0[2]
++
++        $SRL    $tmp3,@X[14],@sigma1[0]
++        $ROTR   $tmp1,@X[14],@sigma1[1]
++        xor     $tmp2,$tmp2,$tmp0                       # sigma0(X[i+1])
++        $ROTR   $tmp0,@X[14],@sigma1[2]
++        xor     $tmp3,$tmp3,$tmp1
++        $ADD    @X[0],@X[0],$tmp2
++        xor     $tmp3,$tmp3,$tmp0                       # sigma1(X[i+14])
++        $ADD    @X[0],@X[0],$tmp3
++___
++        &BODY_00_15(@_);
++}
++
++$FRAMESIZE=16*$SZ+16*$SZREG;
++
++
++$code.=<<___;
++.align	6
++${func}_la:
++.Lla_shortcut:
++___
++$code.=<<___;
++        addi.d  $sp,$sp,-$FRAMESIZE
++        $REG_S  $ra,$sp,`$FRAMESIZE-1*$SZREG`
++        $REG_S  $fp,$sp,`$FRAMESIZE-2*$SZREG`
++        $REG_S  $s7,$sp,`$FRAMESIZE-3*$SZREG`
++        $REG_S  $s6,$sp,`$FRAMESIZE-4*$SZREG`
++        $REG_S  $s5,$sp,`$FRAMESIZE-5*$SZREG`
++        $REG_S  $s4,$sp,`$FRAMESIZE-6*$SZREG`
++        $REG_S  $s3,$sp,`$FRAMESIZE-7*$SZREG`
++        $REG_S  $s2,$sp,`$FRAMESIZE-8*$SZREG`
++        $REG_S  $s1,$sp,`$FRAMESIZE-9*$SZREG`
++        $REG_S  $s0,$sp,`$FRAMESIZE-10*$SZREG`
++___
++$code.=<<___;
++        slli.d  @X[15],$len,`log(16*$SZ)/log(2)`
++___
++$code.=<<___;
++        la.local        $Ktbl,$TABLE      # PIC-ified 'load address'
++
++        $LD     $A,$ctx,`7*$SZ`
++        $LD     $B,$ctx,`3*$SZ`
++        $LD     $C,$ctx,`5*$SZ`
++        $LD     $D,$ctx,`1*$SZ`
++        $LD     $E,$ctx,`2*$SZ`
++        $LD     $F,$ctx,`0*$SZ`                 # load context
++        $LD     $G,$ctx,`4*$SZ`
++        $LD     $H,$ctx,`6*$SZ`
++
++        add.d   @X[15],@X[15],$inp              # pointer to the end of input
++        $REG_S  @X[15],$sp,`16*$SZ`
++        b       .Loop
++
++.align	5
++.Loop:
++        ${LD}   @X[0],$inp,0
++___
++for ($i=0;$i<16;$i++)
++{ &BODY_00_15($i,@V); unshift(@V,pop(@V)); push(@X,shift(@X)); }
++$code.=<<___;
++        b       .L16_xx
++.align	4
++.L16_xx:
++___
++for (;$i<32;$i++)
++{ &BODY_16_XX($i,@V); unshift(@V,pop(@V)); push(@X,shift(@X)); }
++$code.=<<___;
++        andi    @X[6],@X[6],0xfff
++        li.d    @X[7],$lastK
++        addi.d  $Ktbl,$Ktbl,`16*$SZ*2`              # Ktbl+=16
++        bne     @X[6],@X[7],.L16_xx
++
++        $REG_L  @X[15],$sp,`16*$SZ`               # restore pointer to the end of input
++        $LD     @X[0],$ctx,`0*$SZ`
++        $LD     @X[1],$ctx,`1*$SZ`
++        $LD     @X[2],$ctx,`2*$SZ`
++        addi.d  $inp,$inp,`16*$SZ`
++        $LD     @X[3],$ctx,`3*$SZ`
++        $ADD    $F,$F,@X[0]
++        $LD     @X[4],$ctx,`4*$SZ`
++        $ADD    $D,$D,@X[1]
++        $LD     @X[5],$ctx,`5*$SZ`
++        $ADD    $E,$E,@X[2]
++        $LD     @X[6],$ctx,`6*$SZ`
++        $ADD    $B,$B,@X[3]
++        $LD     @X[7],$ctx,`7*$SZ`
++        $ADD    $G,$G,@X[4]
++        $ST     $F,$ctx,`0*$SZ`
++        $ADD    $C,$C,@X[5]
++        $ST     $D,$ctx,`1*$SZ`
++        $ADD    $H,$H,@X[6]
++        $ST     $E,$ctx,`2*$SZ`
++        $ADD    $A,$A,@X[7]
++        $ST     $B,$ctx,`3*$SZ`
++        $ST     $G,$ctx,`4*$SZ`
++        $ST     $C,$ctx,`5*$SZ`
++        $ST     $H,$ctx,`6*$SZ`
++        $ST     $A,$ctx,`7*$SZ`
++
++        addi.d  $Ktbl,$Ktbl,`(16-$rounds)*$SZ*2`  # rewind $Ktbl
++        bne     $inp,@X[15],.Loop
++
++        $REG_L  $ra,$sp,`$FRAMESIZE-1*$SZREG`
++        $REG_L  $fp,$sp,`$FRAMESIZE-2*$SZREG`
++        $REG_L  $s7,$sp,`$FRAMESIZE-3*$SZREG`
++        $REG_L  $s6,$sp,`$FRAMESIZE-4*$SZREG`
++        $REG_L  $s5,$sp,`$FRAMESIZE-5*$SZREG`
++        $REG_L  $s4,$sp,`$FRAMESIZE-6*$SZREG`
++        $REG_L  $s3,$sp,`$FRAMESIZE-7*$SZREG`
++        $REG_L  $s2,$sp,`$FRAMESIZE-8*$SZREG`
++        $REG_L  $s1,$sp,`$FRAMESIZE-9*$SZREG`
++        $REG_L  $s0,$sp,`$FRAMESIZE-10*$SZREG`
++___
++$code.=<<___;
++        addi.d  $sp,$sp,$FRAMESIZE
++        jr      $ra
++.size	${func}_la,.-${func}_la
++.section .rodata
++.align	5
++___
++}}
++
++
++$code =~ s/\`([^\`]*)\`/eval($1)/gem;
++
++print $code;
++
++close STDOUT;
+diff --git a/crypto/sha/build.info b/crypto/sha/build.info
+index df832c5..43787a5 100644
+--- a/crypto/sha/build.info
++++ b/crypto/sha/build.info
+@@ -44,10 +44,12 @@ GENERATE[sha1-parisc.s]=asm/sha1-parisc.pl $(PERLASM_SCHEME)
+ GENERATE[sha256-parisc.s]=asm/sha512-parisc.pl $(PERLASM_SCHEME)
+ GENERATE[sha512-parisc.s]=asm/sha512-parisc.pl $(PERLASM_SCHEME)
+ 
+-GENERATE[sha256-loongarch.S]=asm/sha512-loongarch.pl $(PERLASM_SCHEME)
+-INCLUDE[sha256-loongarch.o]=..
+-GENERATE[sha512-loongarch.S]=asm/sha512-loongarch.pl $(PERLASM_SCHEME)
+-INCLUDE[sha512-loongarch.o]=..
++GENERATE[sha1-loongarch64.S]=asm/sha1-loongarch64.pl $(PERLASM_SCHEME)
++INCLUDE[sha1-loongarch64.o]=..
++GENERATE[sha256-loongarch64.S]=asm/sha512-loongarch64.pl $(PERLASM_SCHEME)
++INCLUDE[sha256-loongarch64.o]=..
++GENERATE[sha512-loongarch64.S]=asm/sha512-loongarch64.pl $(PERLASM_SCHEME)
++INCLUDE[sha512-loongarch64.o]=..
+ 
+ GENERATE[sha1-mips.S]=asm/sha1-mips.pl $(PERLASM_SCHEME)
+ INCLUDE[sha1-mips.o]=..
+-- 
+2.20.1
+

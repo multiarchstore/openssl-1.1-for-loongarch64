@@ -1,0 +1,25 @@
+From 776451803b0d4864ef80a28d8f49364fe2935d7e Mon Sep 17 00:00:00 2001
+From: zhuchen <zhuchen@loongson.cn>
+Date: Fri, 29 Jul 2022 19:45:47 +0800
+Subject: [PATCH 2/5] Add-bn_asm.c-to-fix-compilation-bn_asm_src
+
+---
+ Configurations/00-base-templates.conf | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/Configurations/00-base-templates.conf b/Configurations/00-base-templates.conf
+index 2fbd437..08389d7 100644
+--- a/Configurations/00-base-templates.conf
++++ b/Configurations/00-base-templates.conf
+@@ -287,7 +287,7 @@ my %targets=(
+     },
+     loongarch64_asm => {
+ 	template	=> 1,
+-	bn_asm_src      => "loongarch-mont.S",
++	bn_asm_src      => "bn_asm.c loongarch-mont.S",
+     },
+     s390x_asm => {
+ 	template	=> 1,
+-- 
+2.20.1
+
