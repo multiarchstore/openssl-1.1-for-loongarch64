@@ -25,7 +25,7 @@ sub detect_gnu_cc {
 my %shared_info;
 %shared_info = (
     'gnu-shared' => {
-        shared_ldflag         => '-shared',
+        shared_ldflag         => '-shared -Wl,-Bsymbolic',
         shared_sonameflag     => '-Wl,-soname=',
     },
     'linux-shared' => sub {

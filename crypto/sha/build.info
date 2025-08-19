@@ -44,11 +44,6 @@ GENERATE[sha1-parisc.s]=asm/sha1-parisc.pl $(PERLASM_SCHEME)
 GENERATE[sha256-parisc.s]=asm/sha512-parisc.pl $(PERLASM_SCHEME)
 GENERATE[sha512-parisc.s]=asm/sha512-parisc.pl $(PERLASM_SCHEME)
 
-GENERATE[sha256-loongarch.S]=asm/sha512-loongarch.pl $(PERLASM_SCHEME)
-INCLUDE[sha256-loongarch.o]=..
-GENERATE[sha512-loongarch.S]=asm/sha512-loongarch.pl $(PERLASM_SCHEME)
-INCLUDE[sha512-loongarch.o]=..
-
 GENERATE[sha1-mips.S]=asm/sha1-mips.pl $(PERLASM_SCHEME)
 INCLUDE[sha1-mips.o]=..
 GENERATE[sha256-mips.S]=asm/sha512-mips.pl $(PERLASM_SCHEME)

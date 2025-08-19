@@ -281,8 +281,7 @@ HTMLDIR=$(DOCDIR)/html
 # MANSUFFIX is for the benefit of anyone who may want to have a suffix
 # appended after the manpage file section number.  "ssl" is popular,
 # resulting in files such as config.5ssl rather than config.5.
-MANSUFFIX=ssl
-MANSECTION=SSL
+MANSUFFIX=
 HTMLSUFFIX=html
 
 # For "optional" echo messages, to get "real" silence
@@ -825,8 +824,7 @@ install_man_docs:
 	@[ -n "$(INSTALLTOP)" ] || (echo INSTALLTOP should not be empty; exit 1)
 	@$(ECHO) "*** Installing manpages"
 	$(PERL) $(SRCDIR)/util/process_docs.pl \
-		--destdir=$(DESTDIR)$(MANDIR) --type=man --suffix=$(MANSUFFIX) \
-		--mansection=$(MANSECTION)
+		--destdir=$(DESTDIR)$(MANDIR) --type=man --suffix=$(MANSUFFIX)
 
 uninstall_man_docs:
 	@$(ECHO) "*** Uninstalling manpages"

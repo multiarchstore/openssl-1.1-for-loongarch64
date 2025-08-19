@@ -39,9 +39,6 @@ INCLUDE[bn-mips.o]=..
 GENERATE[mips-mont.S]=asm/mips-mont.pl $(PERLASM_SCHEME)
 INCLUDE[mips-mont.o]=..
 
-GENERATE[loongarch-mont.S]=asm/loongarch-mont.pl $(PERLASM_SCHEME)
-INCLUDE[loongarch-mont.o]=..
-
 GENERATE[s390x-mont.S]=asm/s390x-mont.pl $(PERLASM_SCHEME)
 GENERATE[s390x-gf2m.s]=asm/s390x-gf2m.pl $(PERLASM_SCHEME)
 

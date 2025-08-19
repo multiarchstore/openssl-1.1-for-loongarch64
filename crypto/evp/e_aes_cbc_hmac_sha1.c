@@ -33,7 +33,7 @@ typedef struct {
 
 #define NO_PAYLOAD_LENGTH       ((size_t)-1)
 
-#if     defined(AESNI_ASM) &&     ( \
+#if     defined(AES_ASM) &&     ( \
         defined(__x86_64)       || defined(__x86_64__)  || \
         defined(_M_AMD64)       || defined(_M_X64)      )
 

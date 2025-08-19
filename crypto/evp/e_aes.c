@@ -98,14 +98,8 @@ typedef struct {
 } EVP_AES_OCB_CTX;
 #endif
 
-#if defined(AES_ASM) &&(defined(__loongarch__) || defined(__loongarch64))
-#include "loongarch_arch.h"
-# if defined(VPAES_ASM)
-#   define VPAES_CAPABLE  (OPENSSL_loongarchcap_P & LOONGARCH_CFG2_LSX)
-# endif
-#endif
-
 #define MAXBITCHUNK     ((size_t)1<<(sizeof(size_t)*8-4))
+
 #ifdef VPAES_ASM
 int vpaes_set_encrypt_key(const unsigned char *userKey, int bits,
                           AES_KEY *key);

@@ -8,8 +8,6 @@
  */
 
 #include "internal/refcount.h"
-#include <openssl/x509.h>
-#include <openssl/conf.h>
 
 /* Internal X509 structures and functions: not for application use */
 
@@ -286,6 +284,3 @@ int a2i_ipadd(unsigned char *ipout, const char *ipasc);
 int x509_set1_time(ASN1_TIME **ptm, const ASN1_TIME *tm);
 
 void x509_init_sig_info(X509 *x);
-
-int x509v3_add_len_value_uchar(const char *name, const unsigned char *value,
-			       size_t vallen, STACK_OF(CONF_VALUE) **extlist);

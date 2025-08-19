@@ -161,11 +161,6 @@ void OPENSSL_cpuid_setup(void)
 unsigned int OPENSSL_ia32cap_P[4];
 # endif
 #endif
-
-#if defined (__loongarch__)
-    #define OPENSSL_CPUID_SETUP
-#endif
-
 #if !defined(OPENSSL_CPUID_SETUP) && !defined(OPENSSL_CPUID_OBJ)
 void OPENSSL_cpuid_setup(void)
 {

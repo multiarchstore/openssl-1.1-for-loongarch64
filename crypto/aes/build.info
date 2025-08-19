@@ -22,7 +22,6 @@ GENERATE[aesni-x86_64.s]=asm/aesni-x86_64.pl $(PERLASM_SCHEME)
 GENERATE[aesni-sha1-x86_64.s]=asm/aesni-sha1-x86_64.pl $(PERLASM_SCHEME)
 GENERATE[aesni-sha256-x86_64.s]=asm/aesni-sha256-x86_64.pl $(PERLASM_SCHEME)
 GENERATE[aesni-mb-x86_64.s]=asm/aesni-mb-x86_64.pl $(PERLASM_SCHEME)
-GENERATE[vpaes-loongarch64.s]=asm/vpaes-loongarch64.pl $(PERLASM_SCHEME)
 
 GENERATE[aes-sparcv9.S]=asm/aes-sparcv9.pl $(PERLASM_SCHEME)
 INCLUDE[aes-sparcv9.o]=..
@@ -40,9 +39,6 @@ GENERATE[aes-parisc.s]=asm/aes-parisc.pl $(PERLASM_SCHEME)
 
 GENERATE[aes-mips.S]=asm/aes-mips.pl $(PERLASM_SCHEME)
 INCLUDE[aes-mips.o]=..
-
-GENERATE[aes-loongarch.S]=asm/aes-loongarch.pl $(PERLASM_SCHEME)
-INCLUDE[aes-loongarch.o]=..
 
 GENERATE[aesv8-armx.S]=asm/aesv8-armx.pl $(PERLASM_SCHEME)
 INCLUDE[aesv8-armx.o]=..
